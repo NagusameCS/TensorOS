@@ -1,5 +1,6 @@
-![TV (1)](https://github.com/user-attachments/assets/6f1bf8b7-769e-40ec-bf4f-e6f0dc748d67)
+<img width="1280" height="640" alt="IRIS-MD" src="https://github.com/user-attachments/assets/3fb51941-b10b-4f92-b482-f0e8ff81d97d" />
 # TensorOS
+
 
 **An AI-First Operating System**
 
