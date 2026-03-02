@@ -7,6 +7,12 @@ build/
 *.img
 *.bin
 
+# Auto-generated firmware header (binary blob, ~300KB)
+kernel/drivers/bt/bt_firmware.h
+
+# Firmware blobs (not committed -- download separately)
+firmware/
+
 # Editor/IDE
 .vscode/
 *.swp

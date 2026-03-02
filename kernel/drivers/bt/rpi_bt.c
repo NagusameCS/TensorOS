@@ -15,6 +15,7 @@
  * =============================================================================*/
 
 #include "kernel/core/kernel.h"
+#include "kernel/drivers/bt/bt_firmware.h"
 
 #if defined(__aarch64__)
 
@@ -156,6 +157,11 @@ static void mu_init(uint32_t baud)
 /* HCI command opcodes (OGF | OCF) */
 #define HCI_RESET                   0x0C03
 #define HCI_READ_BD_ADDR            0x1009
+
+/* Broadcom vendor-specific HCI commands */
+#define HCI_VSC_DOWNLOAD_MINIDRIVER 0xFC2E
+#define HCI_VSC_UPDATE_BAUDRATE     0xFC18
+#define HCI_VSC_WRITE_RAM           0xFC4C
 #define HCI_WRITE_LOCAL_NAME        0x0C13
 #define HCI_WRITE_CLASS_OF_DEVICE   0x0C24
 #define HCI_WRITE_SCAN_ENABLE      0x0C1A
@@ -922,6 +928,103 @@ static void handle_hci_acl(const uint8_t *buf, int len)
  * Public API
  * =============================================================================*/
 
+/* =============================================================================
+ * BCM43455 Firmware Upload (patchram via .hcd blob)
+ *
+ * The BCM43455 boots with a minimal ROM that only understands HCI_RESET and
+ * a few vendor-specific commands.  We must upload the full firmware (.hcd)
+ * before the chip can do discovery, pairing, or SPP.
+ *
+ * .hcd file format: concatenated HCI commands in wire format:
+ *   [opcode_lo] [opcode_hi] [param_len] [params...]
+ *
+ * Protocol:
+ *   1. HCI_RESET (chip in ROM mode)
+ *   2. HCI_VSC_DOWNLOAD_MINIDRIVER (0xFC2E) - enter download mode
+ *   3. Send each HCI command from .hcd, wait for cmd_complete
+ *   4. Delay 250ms (chip reboots with new firmware)
+ *   5. HCI_RESET (chip now running full firmware)
+ * =============================================================================*/
+
+static int bt_load_firmware(void)
+{
+    if (bt_firmware_size == 0) {
+        uart_puts("[BT] No firmware blob compiled in -- skipping upload\r\n");
+        return 0;  /* not fatal, chip just won't work properly */
+    }
+
+    uart_puts("[BT] Uploading BCM43455 firmware (");
+    /* Print size */
+    {
+        char tmp[12];
+        int n = 0;
+        uint32_t v = bt_firmware_size;
+        if (v == 0) { tmp[n++] = '0'; }
+        else { while (v > 0) { tmp[n++] = '0' + (v % 10); v /= 10; } }
+        for (int i = n - 1; i >= 0; i--) uart_putchar(tmp[i]);
+    }
+    uart_puts(" bytes)...\r\n");
+
+    /* Step 1: Download Minidriver -- tells chip to accept firmware data */
+    hci_send_cmd0(HCI_VSC_DOWNLOAD_MINIDRIVER);
+    int st = hci_wait_cmd_complete(HCI_VSC_DOWNLOAD_MINIDRIVER, 2000);
+    if (st != 0 && st != -1) {
+        uart_puts("[BT] Download Minidriver failed\r\n");
+        return -1;
+    }
+    arm_timer_delay_ms(50);
+
+    /* Step 2: Send each HCI command from the .hcd blob */
+    uint32_t offset = 0;
+    uint32_t cmd_count = 0;
+    while (offset + 3 <= bt_firmware_size) {
+        uint16_t opcode = (uint16_t)bt_firmware[offset] |
+                         ((uint16_t)bt_firmware[offset + 1] << 8);
+        uint8_t  plen   = bt_firmware[offset + 2];
+        offset += 3;
+
+        if (offset + plen > bt_firmware_size) {
+            uart_puts("[BT] Firmware blob truncated\r\n");
+            return -2;
+        }
+
+        /* Send as HCI command */
+        hci_send_cmd(opcode, &bt_firmware[offset], plen);
+        offset += plen;
+        cmd_count++;
+
+        /* Wait for command complete (some vendor cmds use cmd_status) */
+        st = hci_wait_cmd_complete(opcode, 1000);
+        /* Don't fail on individual commands -- some return non-zero
+         * status for informational reasons (e.g. "already configured") */
+    }
+
+    uart_puts("[BT] Firmware uploaded (");
+    {
+        char tmp[12];
+        int n = 0;
+        uint32_t v = cmd_count;
+        if (v == 0) { tmp[n++] = '0'; }
+        else { while (v > 0) { tmp[n++] = '0' + (v % 10); v /= 10; } }
+        for (int i = n - 1; i >= 0; i--) uart_putchar(tmp[i]);
+    }
+    uart_puts(" HCI commands)\r\n");
+
+    /* Step 3: Chip reboots with new firmware -- wait for it */
+    arm_timer_delay_ms(250);
+
+    /* Step 4: HCI_RESET on the new firmware */
+    hci_send_cmd0(HCI_RESET);
+    st = hci_wait_cmd_complete(HCI_RESET, 3000);
+    if (st != 0) {
+        uart_puts("[BT] Post-firmware HCI_RESET failed\r\n");
+        return -3;
+    }
+    uart_puts("[BT] Post-firmware HCI_RESET OK\r\n");
+
+    return 0;
+}
+
 int bt_init(void)
 {
     /* LED ON = starting BT init (will turn OFF on success) */
@@ -937,14 +1040,13 @@ int bt_init(void)
     /* Drain any stale data */
     while (mu_has_data()) (void)mu_getc();
 
-    uart_puts("[BT] Sending HCI_RESET...\r\n");
+    uart_puts("[BT] Sending HCI_RESET (ROM mode)...\r\n");
 
-    /* HCI Reset */
+    /* HCI Reset (chip in ROM mode -- only basic commands work) */
     hci_send_cmd0(HCI_RESET);
     int status = hci_wait_cmd_complete(HCI_RESET, 3000);
     if (status != 0) {
-        /* LED stays ON = HCI_RESET failed */
-        uart_puts("[BT] HCI_RESET FAILED — chip not responding\r\n");
+        uart_puts("[BT] HCI_RESET FAILED -- chip not responding\r\n");
 
         /* Try once more after toggling PL011 and longer delay */
         mmio_write(UART_CR, 0);       /* disable UART */
@@ -962,7 +1064,14 @@ int bt_init(void)
         uart_puts("[BT] HCI_RESET retry OK\r\n");
     }
 
-    uart_puts("[BT] HCI_RESET OK\r\n");
+    uart_puts("[BT] HCI_RESET OK (ROM mode)\r\n");
+
+    /* Upload BCM43455 firmware (.hcd patchram) */
+    int fw_rc = bt_load_firmware();
+    if (fw_rc < 0) {
+        uart_puts("[BT] Firmware upload failed -- continuing without BT\r\n");
+        return -2;  /* LED stays ON = failure */
+    }
 
     arm_timer_delay_ms(50);
 

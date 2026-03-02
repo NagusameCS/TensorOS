@@ -79,6 +79,22 @@ if ($Clean) {
 
 if (-not (Test-Path $BUILD)) { New-Item -ItemType Directory $BUILD | Out-Null }
 
+# Step 0: Generate BT firmware header from .hcd blob
+$hcdFile = Join-Path $PSScriptRoot "firmware\BCM4345C0.hcd"
+$fwHeader = Join-Path $PSScriptRoot "kernel\drivers\bt\bt_firmware.h"
+$needRegen = $true
+if (Test-Path $fwHeader) {
+    if (Test-Path $hcdFile) {
+        $needRegen = (Get-Item $hcdFile).LastWriteTime -gt (Get-Item $fwHeader).LastWriteTime
+    } else {
+        $needRegen = $false  # stub already exists
+    }
+}
+if ($needRegen) {
+    Write-Host "=== Generating BT firmware header ===" -ForegroundColor Cyan
+    & (Join-Path $PSScriptRoot "tools\hcd2header.ps1") -InputFile $hcdFile -OutputFile $fwHeader
+}
+
 # Step 1: Compile C -> asm -> fix string sections -> .o
 Write-Host "=== Compiling $($SOURCES.Count) C sources (AArch64) ===" -ForegroundColor Cyan
 $failed = 0
