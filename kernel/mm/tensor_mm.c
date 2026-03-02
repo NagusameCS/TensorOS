@@ -414,9 +414,9 @@ void tensor_mm_init(void)
     /* Initialize slab caches */
     kmemset(slab_caches, 0, sizeof(slab_caches));
 
-    kprintf_debug("[MM] Initialized: %llu MB total, %llu MB free\n",
+    kprintf_debug("[MM] Initialized: %lu MB total, %lu MB free\n",
                   phys_mem_total / (1024 * 1024), phys_mem_free / (1024 * 1024));
-    kprintf_debug("[MM] Tensor heap: %llu MB, Model cache: %llu MB\n",
+    kprintf_debug("[MM] Tensor heap: %lu MB, Model cache: %lu MB\n",
                   tensor_heap_size / (1024 * 1024), model_cache.max_size / (1024 * 1024));
 }
 

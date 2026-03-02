@@ -46,6 +46,7 @@ static float evo_randf(void)
 }
 
 /* Random float in [0, 1] */
+__attribute__((unused))
 static float evo_rand01(void)
 {
     return (float)evo_rand() / 32768.0f;

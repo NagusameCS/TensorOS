@@ -33,7 +33,7 @@ int ipc_channel_create(uint64_t sender_meu, uint64_t receiver_meu,
     /* Allocate shared buffer for zero-copy transfers */
     ch->shared_buffer = tensor_alloc_shared(buffer_size);
 
-    kprintf_debug("[IPC] Channel %d created: MEU %llu -> MEU %llu (%llu KB buffer)\n",
+    kprintf_debug("[IPC] Channel %d created: MEU %lu -> MEU %lu (%lu KB buffer)\n",
                   ch->id, sender_meu, receiver_meu, buffer_size / 1024);
     return ch->id;
 }

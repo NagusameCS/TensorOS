@@ -242,7 +242,7 @@ void deploy_print_status(void)
             svc->state == DEPLOY_STATE_DRAINING ? "DRAINING" :
             svc->state == DEPLOY_STATE_FAILED   ? "FAILED"   : "UNKNOWN";
 
-        kprintf("%-16s %-10s %-6d %-8d %-12llu %-12llu\n",
+        kprintf("%-16s %-10s %-6d %-8d %-12lu %-12lu\n",
                 svc->name, state_str, svc->port,
                 svc->replica_count, svc->total_requests, svc->total_errors);
     }

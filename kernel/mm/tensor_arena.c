@@ -189,6 +189,7 @@ void arena_run_demos(void)
 
         /* Outer scope: persistent buffer */
         float *persistent = (float *)arena_alloc(&arena, 2048 * sizeof(float));
+        (void)persistent;
         uint64_t outer_used = arena_used(&arena);
         kprintf("  Outer scope: %lu bytes (persistent buffer)\n", outer_used);
 
@@ -196,6 +197,7 @@ void arena_run_demos(void)
         arena_checkpoint(&arena);
         float *temp1 = (float *)arena_alloc(&arena, 4096 * sizeof(float));
         float *temp2 = (float *)arena_alloc(&arena, 4096 * sizeof(float));
+        (void)temp1; (void)temp2;
         kprintf("  Inner scope: %lu bytes (+ temp buffers)\n", arena_used(&arena));
 
         /* Restore — temps are freed, persistent remains */
@@ -337,6 +339,7 @@ void arena_run_demos(void)
 
         uint64_t arena_us = perf_cycles_to_us(t1 - t0);
         uint64_t std_us = perf_cycles_to_us(t3 - t2);
+        (void)arena_us; (void)std_us;
         uint64_t arena_ns = perf_cycles_to_ns(t1 - t0) / iters;
         uint64_t std_ns = perf_cycles_to_ns(t3 - t2) / iters;
 

@@ -70,6 +70,7 @@ static uint32_t prng_next(void)
 }
 
 /* Random float in [0, 1) */
+__attribute__((unused))
 static inline float prng_uniform(void)
 {
     return (float)(prng_next() >> 8) / 16777216.0f; /* 2^24 */

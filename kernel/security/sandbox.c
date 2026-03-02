@@ -49,7 +49,7 @@ sandbox_t *sandbox_create(const char *name, sandbox_policy_t policy)
     sb->gpu_mem_limit = 4ULL * 1024 * 1024 * 1024;  /* 4GB */
     sb->tensor_ops_limit = 0; /* Unlimited */
 
-    kprintf_debug("[SANDBOX] Created sandbox %llu '%s' policy=%d\n",
+    kprintf_debug("[SANDBOX] Created sandbox %lu '%s' policy=%d\n",
                   sb->id, sb->name, policy);
     return sb;
 }
@@ -254,7 +254,7 @@ int sandbox_set_deterministic(uint64_t sandbox_id, bool deterministic,
     sb->random_seed = seed;
 
     if (deterministic) {
-        kprintf_debug("[SANDBOX] Sandbox %llu set to deterministic mode (seed=%llu)\n",
+        kprintf_debug("[SANDBOX] Sandbox %lu set to deterministic mode (seed=%lu)\n",
                       sandbox_id, seed);
     }
     return 0;

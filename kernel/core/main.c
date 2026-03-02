@@ -872,10 +872,10 @@ static void kernel_idle_loop(void)
             kstate.uptime_ticks++;
 
             /* Log health status */
-            kprintf_debug("[IDLE] ops=%llu models=%u mem_free=%u MB\n",
+            kprintf_debug("[IDLE] ops=%lu models=%u mem_free=%lu MB\n",
                          kstate.tensor_ops_total,
                          kstate.models_loaded,
-                         tensor_mm_free_bytes() / (1024 * 1024));
+                         (uint64_t)(tensor_mm_free_bytes() / (1024 * 1024)));
         }
 
         idle_cycles++;

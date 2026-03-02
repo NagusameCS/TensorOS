@@ -803,7 +803,7 @@ static void demo_xor(void)
     kprintf("  XOR network (2 layers, 4->4->4, 24 weights):\n");
 
     /* Eager forward pass */
-    int pass = 1;
+    int pass = 1;  (void)pass;
     for (int t = 0; t < 4; t++) {
         nn_forward(&model, output, inputs[t]);
         int ok = (output[0] > 0.5f) == (expected[t] > 0.5f);
@@ -1275,7 +1275,7 @@ static void demo_edge_ai(void)
     kprintf("    Linux RTOS + TFLite:    ~50,000 ns (estimated)\n");
     kprintf("    Zephyr + TFLite Micro:  ~10,000 ns (estimated)\n");
     kprintf("    => %lux faster than Linux for safety-critical AI\n",
-            (ns_per > 0) ? (500000ULL / ns_per) : 0);
+            (ns_per > 0) ? (500000UL / ns_per) : 0UL);
 
     kprintf("\n  Use case: Industrial IoT safety monitoring\n");
     kprintf("  Boot to inference: < 1 second\n");

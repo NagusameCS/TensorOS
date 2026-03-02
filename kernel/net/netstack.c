@@ -62,6 +62,7 @@ static int ip_eq(const uint8_t a[4], const uint8_t b[4])
     return a[0]==b[0] && a[1]==b[1] && a[2]==b[2] && a[3]==b[3];
 }
 
+__attribute__((unused))
 static int mac_eq(const uint8_t a[6], const uint8_t b[6])
 {
     return a[0]==b[0] && a[1]==b[1] && a[2]==b[2] &&
@@ -69,6 +70,7 @@ static int mac_eq(const uint8_t a[6], const uint8_t b[6])
 }
 
 static const uint8_t broadcast_mac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+__attribute__((unused))
 static const uint8_t zero_mac[6] = {0,0,0,0,0,0};
 
 /* =============================================================================

@@ -290,6 +290,7 @@ void q4_forward(q4_model_t *model, float *output, const float *input)
  * Quantization Error Analysis
  * =============================================================================*/
 
+__attribute__((unused))
 static float q4_max_error(const nn_model_t *fm, const q4_model_t *qm,
                           const float *input)
 {
@@ -501,7 +502,7 @@ void q4_run_demos(void)
         float dequant[32] __attribute__((aligned(16)));
         q4_dequantize_block(dequant, &blk);
 
-        float block_err = 0.0f, block_l2 = 0.0f;
+        float block_err = 0.0f, block_l2 = 0.0f;  (void)block_l2;
         for (int i = 0; i < 32; i++) {
             float e = q4_fabsf(test_vals[i] - dequant[i]);
             if (e > block_err) block_err = e;

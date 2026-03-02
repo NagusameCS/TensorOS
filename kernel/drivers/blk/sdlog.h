@@ -40,6 +40,7 @@ static uint8_t  sdlog_sector_buf[512] __attribute__((aligned(4)));
 /* ---- Helpers ---- */
 
 /* Simple strlen */
+__attribute__((unused))
 static uint32_t sdlog_strlen(const char *s) {
     uint32_t n = 0;
     while (*s++) n++;
@@ -47,6 +48,7 @@ static uint32_t sdlog_strlen(const char *s) {
 }
 
 /* Simple memcmp */
+__attribute__((unused))
 static int sdlog_memcmp(const void *a, const void *b, uint32_t n) {
     const uint8_t *pa = (const uint8_t *)a;
     const uint8_t *pb = (const uint8_t *)b;
@@ -57,17 +59,20 @@ static int sdlog_memcmp(const void *a, const void *b, uint32_t n) {
 }
 
 /* Read uint16 LE from buffer */
+__attribute__((unused))
 static inline uint16_t rd16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
 /* Read uint32 LE from buffer */
+__attribute__((unused))
 static inline uint32_t rd32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
 /* Append a decimal number to the log buffer */
+__attribute__((unused))
 static void sdlog_put_num(int32_t v) {
     if (sdlog_pos >= SDLOG_MAX_BYTES - 16) return;
     if (v < 0) {
@@ -83,6 +88,7 @@ static void sdlog_put_num(int32_t v) {
 }
 
 /* Append a hex number to the log buffer */
+__attribute__((unused))
 static void sdlog_put_hex(uint64_t v) {
     if (sdlog_pos >= SDLOG_MAX_BYTES - 20) return;
     static const char hex[] = "0123456789ABCDEF";
@@ -110,6 +116,7 @@ static void sdlog_put_hex(uint64_t v) {
  *
  * Returns 0 on success, negative on failure.
  * =============================================================================*/
+__attribute__((unused))
 static int sdlog_init(void)
 {
     sdlog_pos = 0;
@@ -161,7 +168,7 @@ static int sdlog_init(void)
 
     uint32_t dir_cluster = root_cluster;
     uint32_t file_cluster = 0;
-    uint32_t file_size = 0;
+    uint32_t file_size = 0;  (void)file_size;
     int found = 0;
 
     /* Walk directory clusters (up to 16 clusters = lots of entries) */
@@ -256,6 +263,7 @@ static int sdlog_init(void)
 /* =============================================================================
  * sdlog — Append a log message (with newline)
  * =============================================================================*/
+__attribute__((unused))
 static void sdlog(const char *msg)
 {
     if (!sdlog_ready) return;
@@ -268,6 +276,7 @@ static void sdlog(const char *msg)
 }
 
 /* Log message with a decimal value: "msg: value" */
+__attribute__((unused))
 static void sdlog_val(const char *msg, int32_t val)
 {
     if (!sdlog_ready) return;
@@ -281,6 +290,7 @@ static void sdlog_val(const char *msg, int32_t val)
 }
 
 /* Log message with a hex value: "msg: 0xVALUE" */
+__attribute__((unused))
 static void sdlog_hex(const char *msg, uint64_t val)
 {
     if (!sdlog_ready) return;
@@ -296,6 +306,7 @@ static void sdlog_hex(const char *msg, uint64_t val)
 /* =============================================================================
  * sdlog_flush — Write log buffer to BOOTLOG.TXT sectors on SD card
  * =============================================================================*/
+__attribute__((unused))
 static void sdlog_flush(void)
 {
     if (!sdlog_ready || sdlog_file_sector == 0) return;
@@ -328,6 +339,7 @@ static void sdlog_flush(void)
 /* =============================================================================
  * sdlog_panic — Log a message, flush to SD, then blink LED rapidly
  * =============================================================================*/
+__attribute__((unused))
 static void sdlog_panic(const char *msg)
 {
     sdlog(msg);

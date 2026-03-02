@@ -161,7 +161,7 @@ int gpu_tensor_matmul(uint32_t gpu_id, tensor_desc_t *C,
     if (A->ndim < 2 || B->ndim < 2) return -1;
     if (A->shape[A->ndim - 1] != B->shape[B->ndim - 2]) return -1;
 
-    kprintf_debug("[GPU %d] matmul: [%llu,%llu] x [%llu,%llu]\n",
+    kprintf_debug("[GPU %d] matmul: [%lu,%lu] x [%lu,%lu]\n",
                   gpu_id, A->shape[0], A->shape[1], B->shape[0], B->shape[1]);
 
     /* TODO: Submit compute kernel to GPU command queue */
@@ -181,7 +181,7 @@ int gpu_tensor_attention(uint32_t gpu_id, tensor_desc_t *output,
 {
     if (gpu_id >= gpu_count) return -1;
 
-    kprintf_debug("[GPU %d] attention: Q[%llu,%llu] scale=%.4f\n",
+    kprintf_debug("[GPU %d] attention: Q[%lu,%lu] scale=%.4f\n",
                   gpu_id, Q->shape[0], Q->shape[1], scale);
 
     /* Fused attention kernel for efficiency:

@@ -146,7 +146,7 @@ model_exec_unit_t *meu_create(const char *name, meu_type_t type,
 
     kstate.models_loaded++;
 
-    kprintf_debug("[SCHED] Created MEU %llu '%s' type=%d prio=%d\n",
+    kprintf_debug("[SCHED] Created MEU %lu '%s' type=%d prio=%d\n",
                   meu->meu_id, meu->name, type, priority);
     return meu;
 }
@@ -171,7 +171,7 @@ void meu_destroy(model_exec_unit_t *meu)
     kstate.models_loaded--;
 
     meu->state = MEU_STATE_COMPLETED;
-    kprintf_debug("[SCHED] Destroyed MEU %llu '%s' (ops=%llu)\n",
+    kprintf_debug("[SCHED] Destroyed MEU %lu '%s' (ops=%lu)\n",
                   meu->meu_id, meu->name, meu->tensor_ops);
 }
 
@@ -351,7 +351,7 @@ void tensor_sched_dispatch(void)
     meu->state = MEU_STATE_RUNNING;
     g_scheduler.total_dispatches++;
 
-    kprintf_debug("[SCHED] Dispatching MEU %llu '%s' -> %s %d\n",
+    kprintf_debug("[SCHED] Dispatching MEU %lu '%s' -> %s %d\n",
                   meu->meu_id, meu->name,
                   meu->gpu_id != (uint32_t)-1 ? "GPU" : "CPU",
                   meu->gpu_id != (uint32_t)-1 ? meu->gpu_id : 0);
@@ -373,7 +373,7 @@ void tensor_sched_yield(model_exec_unit_t *meu)
 void tensor_sched_block(model_exec_unit_t *meu, const char *reason)
 {
     meu->state = MEU_STATE_WAITING;
-    kprintf_debug("[SCHED] MEU %llu blocked: %s\n", meu->meu_id, reason);
+    kprintf_debug("[SCHED] MEU %lu blocked: %s\n", meu->meu_id, reason);
 }
 
 void tensor_sched_unblock(model_exec_unit_t *meu)
@@ -454,7 +454,7 @@ int tensor_sched_migrate_device(model_exec_unit_t *meu, uint32_t new_device)
     dev->meu_count++;
 
     g_scheduler.total_migrations++;
-    kprintf_debug("[SCHED] Migrated MEU %llu to GPU %d\n", meu->meu_id, new_device);
+    kprintf_debug("[SCHED] Migrated MEU %lu to GPU %d\n", meu->meu_id, new_device);
     return 0;
 }
 

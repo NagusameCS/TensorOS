@@ -43,6 +43,7 @@ static void ota_puts(const char *s)
     bt_poll();  /* flush BT TX */
 }
 
+__attribute__((unused))
 static int ota_has_data(void)
 {
     if (uart_has_data()) return 1;
@@ -51,6 +52,7 @@ static int ota_has_data(void)
     return 0;
 }
 
+__attribute__((unused))
 static uint8_t ota_getc(void)
 {
     while (1) {
@@ -61,6 +63,7 @@ static uint8_t ota_getc(void)
     }
 }
 
+__attribute__((unused))
 static uint8_t ota_getc_timeout(uint32_t ms)
 {
     uint64_t deadline = arm_timer_count() + (arm_timer_freq() * ms / 1000);
@@ -409,7 +412,7 @@ dir_end:
     /* Write data following the cluster chain */
     cluster = file_cluster;
     uint32_t written = 0;
-    uint32_t cluster_bytes = spc * 512;
+    uint32_t cluster_bytes = spc * 512;  (void)cluster_bytes;
 
     while (written < size) {
         uint32_t cluster_lba = data_start + (cluster - 2) * spc;

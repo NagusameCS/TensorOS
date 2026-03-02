@@ -173,6 +173,7 @@ int virtio_blk_init(void)
 
     /* Accept all features (we don't need any specific ones) */
     uint32_t features = inl(io + VIRTIO_REG_DEVICE_FEATURES);
+    (void)features;
     outl(io + VIRTIO_REG_GUEST_FEATURES, 0);
 
     /* Read device config: capacity */

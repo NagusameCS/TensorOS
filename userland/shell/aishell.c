@@ -20,6 +20,7 @@ static int shell_strcmp(const char *a, const char *b)
     return *(unsigned char *)a - *(unsigned char *)b;
 }
 
+__attribute__((unused))
 static int shell_strncmp(const char *a, const char *b, uint64_t n)
 {
     while (n && *a && *a == *b) { a++; b++; n--; }
@@ -131,7 +132,7 @@ static int cmd_model(aishell_t *sh, int argc, char **argv)
         kprintf("---  ---------  -------------------  -----------  -----------\n");
         for (uint32_t i = 0; i < kstate.meu_count; i++) {
             model_exec_unit_t *meu = &kstate.meus[i];
-            kprintf("%3u  %-9s  %-19s  %11llu  %11llu\n",
+            kprintf("%3u  %-9s  %-19s  %11lu  %11lu\n",
                     (uint32_t)meu->meu_id,
                     meu->state == MEU_STATE_RUNNING ? "RUNNING" :
                     meu->state == MEU_STATE_READY   ? "READY"   :
@@ -229,7 +230,7 @@ static int cmd_git(aishell_t *sh, int argc, char **argv)
 
     if (shell_strcmp(argv[1], "init") == 0) {
         git_repo_t repo;
-        int r = git_repo_init(&repo, "/");
+        int r = git_repo_init("/", &repo);
         kprintf(r == 0 ? "Initialized git repository\n" : "Failed to init repo\n");
         return r;
     }
@@ -297,12 +298,12 @@ static int cmd_sandbox(aishell_t *sh, int argc, char **argv)
 static int cmd_monitor(aishell_t *sh, int argc, char **argv)
 {
     kprintf("=== TensorOS System Monitor ===\n");
-    kprintf("Uptime:          %llu ticks\n", kstate.uptime_ticks);
+    kprintf("Uptime:          %lu ticks\n", kstate.uptime_ticks);
     kprintf("MEUs running:    %d\n", kstate.meu_count);
     kprintf("GPUs detected:   %d\n", kstate.gpu_count);
-    kprintf("Tensor ops:      %llu\n", kstate.tensor_ops_total);
-    kprintf("Memory used:     %llu MB\n", kstate.memory_used_bytes / (1024*1024));
-    kprintf("Memory total:    %llu MB\n", kstate.memory_total_bytes / (1024*1024));
+    kprintf("Tensor ops:      %lu\n", kstate.tensor_ops_total);
+    kprintf("Memory used:     %lu MB\n", kstate.memory_used_bytes / (1024*1024));
+    kprintf("Memory total:    %lu MB\n", kstate.memory_total_bytes / (1024*1024));
     return 0;
 }
 
@@ -370,7 +371,7 @@ static int cmd_status(aishell_t *sh, int argc, char **argv)
     kprintf("  TSC:        %lu MHz\n", perf_tsc_mhz());
     kprintf("  Memory:     %lu MB free\n", tensor_mm_free_bytes() / (1024*1024));
     kprintf("  MEUs:       %d running\n", kstate.meu_count);
-    kprintf("  Tensor ops: %llu total\n", kstate.tensor_ops_total);
+    kprintf("  Tensor ops: %lu total\n", kstate.tensor_ops_total);
     kprintf("  SIMD:       SSE2 (4-wide float)\n");
     kprintf("  Shell cmds: %u executed\n", sh->commands_executed);
     kprintf("\n");

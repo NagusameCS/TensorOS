@@ -118,16 +118,16 @@ void monitor_print_dashboard(tensor_monitor_t *mon)
     kprintf("+--------------------------------------------------------------+\n");
 
     /* System Overview */
-    kprintf("|  Uptime: %llu ticks                                          |\n",
+    kprintf("|  Uptime: %lu ticks                                          |\n",
             s->timestamp);
     kprintf("|  MEUs Running: %-4d    Queued: %-4d                          |\n",
             s->meu_running_count, s->meu_queued_count);
-    kprintf("|  Tensor Ops/s: %-10llu                                     |\n",
+    kprintf("|  Tensor Ops/s: %-10lu                                     |\n",
             s->tensor_ops_per_sec);
 
     /* Memory */
     kprintf("+--------------------------------------------------------------+\n");
-    kprintf("|  Memory: %llu / %llu MB  ",
+    kprintf("|  Memory: %lu / %lu MB  ",
             s->memory_used / (1024*1024), s->memory_total / (1024*1024));
     /* Progress bar */
     uint32_t bar_width = 30;
@@ -142,7 +142,7 @@ void monitor_print_dashboard(tensor_monitor_t *mon)
     /* GPU */
     if (kstate.gpu_count > 0) {
         kprintf("+--------------------------------------------------------------+\n");
-        kprintf("|  GPU #0: %dC  Util: %d%%  VRAM: %llu/%llu MB  Power: %dW     |\n",
+        kprintf("|  GPU #0: %dC  Util: %d%%  VRAM: %lu/%lu MB  Power: %dW     |\n",
                 s->gpu_temp_celsius, s->gpu_util_percent,
                 s->gpu_vram_used / (1024*1024), s->gpu_vram_total / (1024*1024),
                 s->gpu_power_watts);

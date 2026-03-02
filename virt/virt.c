@@ -295,7 +295,7 @@ int virt_shared_mem_create(uint32_t container_id, uint64_t size,
 
     if (region) *region = *r;
 
-    kprintf_debug("[VIRT] Shared memory: %llu KB for container %d\n",
+    kprintf_debug("[VIRT] Shared memory: %lu KB for container %d\n",
                   size / 1024, container_id);
     return 0;
 }

@@ -36,6 +36,7 @@ static inline v4f v4f_zero(void)
 }
 
 /* Extract one lane from a v4f */
+__attribute__((unused))
 static inline float v4f_lane(v4f v, int i)
 {
     union { v4f vec; float f[4]; } u;
@@ -52,6 +53,7 @@ static inline float v4f_hsum(v4f v)
 }
 
 /* Horizontal max of 4 floats */
+__attribute__((unused))
 static inline float v4f_hmax(v4f v)
 {
     union { v4f vec; float f[4]; } u;
@@ -121,7 +123,7 @@ float fast_expf(float x)
     float r = x - nf * LN2_HI - nf * LN2_LO;
 
     /* Degree-5 minimax polynomial for exp(r) on [-ln2/2, ln2/2] */
-    float r2 = r * r;
+    float r2 = r * r;  (void)r2;
     float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.166666667f +
               r * (0.041666668f + r * 0.008333334f))));
 
@@ -407,6 +409,7 @@ static inline void prefetch_l1(const void *addr)
 #endif
 }
 
+__attribute__((unused))
 static inline void prefetch_l2(const void *addr)
 {
 #if defined(__aarch64__)

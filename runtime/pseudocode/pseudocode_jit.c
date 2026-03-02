@@ -34,6 +34,7 @@
  * =============================================================================*/
 
 static bool jit_initialized = false;
+__attribute__((unused))
 static uint64_t jit_compilation_count = 0;
 
 int pseudocode_jit_init(void)
@@ -791,7 +792,7 @@ static runtime_value_t interpret_node(pseudo_runtime_t *rt, ast_node_t *node)
         {
             runtime_value_t val = interpret_node(rt, node->children[0]);
             switch (val.type) {
-            case VAL_INT:    kprintf("%lld\n", val.int_val); break;
+            case VAL_INT:    kprintf("%ld\n", val.int_val); break;
             case VAL_FLOAT:  kprintf("%f\n", val.float_val); break;
             case VAL_BOOL:   kprintf("%s\n", val.bool_val ? "true" : "false"); break;
             case VAL_STRING: kprintf("%s\n", val.string_val); break;

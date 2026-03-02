@@ -21,8 +21,7 @@ $CFLAGS = @(
     "-ffreestanding", "-fno-builtin", "-fno-stack-protector",
     "-nostdlib", "-fno-pic", "-fno-pie",
     "-O2", "-fno-sanitize=all",
-    "-Wno-unused-function", "-Wno-unused-variable", "-Wno-format",
-    "-Wno-incompatible-pointer-types", "-Wno-int-conversion",
+    "-Wall",
     "-I.", "-S"
 )
 

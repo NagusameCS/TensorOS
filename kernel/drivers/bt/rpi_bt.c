@@ -348,6 +348,7 @@ static l2cap_channel_t *l2cap_find_local(uint16_t cid)
     return (l2cap_channel_t *)0;
 }
 
+__attribute__((unused))
 static l2cap_channel_t *l2cap_find_psm(uint16_t psm)
 {
     for (int i = 0; i < L2CAP_MAX_CHANNELS; i++)
@@ -725,7 +726,7 @@ static void rfcomm_handle(const uint8_t *data, int len, l2cap_channel_t *ch)
     const uint8_t *payload = data + doff;
     /* FCS is at data[doff + dlen] */
 
-    uint8_t resp_ctrl = ctrl;
+    uint8_t resp_ctrl = ctrl;  (void)resp_ctrl;
 
     if (ctrl == RFCOMM_SABM || ctrl == (RFCOMM_SABM | 0x10)) {
         /* Respond with UA */

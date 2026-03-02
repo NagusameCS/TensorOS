@@ -570,7 +570,7 @@ void gguf_run_demos(void)
     while (w.pos % 32 != 0) write_u8(&w, 0);
 
     /* Write some fake tensor data (just fill with pattern) */
-    uint64_t data_start = w.pos;
+    uint64_t data_start = w.pos;  (void)data_start;
     for (uint64_t i = 0; i < offset && w.pos < w.capacity; i++) {
         write_u8(&w, (uint8_t)(i & 0xFF));
     }

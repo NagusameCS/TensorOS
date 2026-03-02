@@ -24,6 +24,7 @@ void vga_init(void) {
 }
 static void vga_putchar(char c) { fb_putchar(c); }
 static void vga_puts(const char *s) { fb_puts(s); }
+__attribute__((unused))
 static void vga_scroll(void) { /* handled internally by fb_putchar */ }
 #else
 #define VGA_ADDR   0xB8000

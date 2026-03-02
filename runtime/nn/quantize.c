@@ -210,7 +210,7 @@ void nn_qforward(nn_qmodel_t *model, float *output, const float *input)
         /* Step 1: Quantize input activations (vectorized absmax) */
         v4i32 sign_mask_i = (v4i32){0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF};
         union { v4i32 i; v4f f; } umask = { .i = sign_mask_i };
-        v4f vabs_mask = umask.f;
+        v4f vabs_mask = umask.f;  (void)vabs_mask;
 
         v4f vmax = (v4f){0, 0, 0, 0};
         int jj = 0;

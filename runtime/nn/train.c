@@ -708,9 +708,11 @@ void nn_train_demos(void)
     float pipe_loss = nn_train(&pipe_model, (const float *)X_cls, (const float *)Y_cls,
                                8, 8, 4, &cfg_pipe);
     uint64_t p1 = rdtsc_fenced();
+    (void)pipe_loss;
 
     int pipe_correct = 0;
     static const char *pnames[4] = {"A", "B", "C", "D"};
+    (void)pnames;
     for (int t = 0; t < 4; t++) {
         nn_forward(&pipe_model, output, X_cls[t]);
         int best = tensor_cpu_argmax(output, 4);
