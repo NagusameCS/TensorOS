@@ -309,12 +309,4 @@ Any text that isn't a built-in command is automatically JIT-compiled as Pseudoco
 - [ ] Flash Attention kernel
 - [ ] PagedAttention (vLLM-style) for serving
 
----
 
-## License
-
-TensorOS is an experimental research OS. Use at your own risk. Run only in QEMU or a virtual machine.
-
----
-
-*Built for a world where AI is not an app — it's the operating system.*
