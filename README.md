@@ -1,6 +1,17 @@
 
 <img width="1280" height="640" alt="IRIS-MD (1)" src="https://github.com/user-attachments/assets/8f3c9f14-b653-47bf-9ad7-bedadf578e58" />
 
+<p align="center">
+  <img src="https://img.shields.io/badge/lang-C11-blue?logo=c&logoColor=white" alt="Language">
+  <img src="https://img.shields.io/badge/arch-x86__64_%7C_ARM64-orange" alt="Architecture">
+  <img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build">
+  <img src="https://img.shields.io/badge/warnings-0_(%E2%80%93Wall)-brightgreen" alt="Warnings">
+  <img src="https://img.shields.io/badge/source-29K_lines-informational" alt="Lines of Code">
+  <img src="https://img.shields.io/badge/platform-bare--metal-critical" alt="Bare Metal">
+  <img src="https://img.shields.io/github/last-commit/NagusameCS/TensorOS?label=last%20commit" alt="Last Commit">
+  <img src="https://img.shields.io/github/stars/NagusameCS/TensorOS?style=flat" alt="Stars">
+</p>
+
 TensorOS is an operating system built from scratch with a single goal: **run AI workloads faster and cheaper, without losing accuracy.** Every layer — from the bootloader to the shell — is designed around tensors, models, and inference as first-class primitives.
 
 Traditional OSes treat AI as just another application. TensorOS treats AI as *the* application.
@@ -9,28 +20,82 @@ Traditional OSes treat AI as just another application. TensorOS treats AI as *th
 
 ## Architecture Overview
 
+```mermaid
+graph TB
+    subgraph Userland["<b>Userland</b>"]
+        direction LR
+        Shell["AI Shell<br/><small>model load &#x2502; infer &#x2502; deploy</small>"]
+        Monitor["Monitor<br/><small>GPU/Mem/MEU stats</small>"]
+        Deploy["Deploy Service<br/><small>A/B &#x2502; autoscale</small>"]
+        Train["Train Service<br/><small>backprop &#x2502; checkpoints</small>"]
+    end
+
+    subgraph Runtime["<b>Runtime</b>"]
+        direction LR
+        Engine["Tensor Engine<br/><small>eager ops &#x2502; compute graphs</small>"]
+        JIT["Pseudocode JIT<br/><small>4-tier compilation</small>"]
+        NN["Neural Network Libs<br/><small>inference &#x2502; quantize &#x2502; GGUF</small>"]
+        SNE["Speculative Neural<br/>Execution<br/><small>5 techniques</small>"]
+    end
+
+    subgraph Kernel["<b>Kernel</b>"]
+        direction LR
+        Sched["Tensor Scheduler<br/><small>MEU-based &#x2502; GPU scoring</small>"]
+        MM["Memory Manager<br/><small>tensor zones &#x2502; model cache</small>"]
+        Git["Native Git<br/><small>SHA-256 &#x2502; tensor objects</small>"]
+        IPC["IPC<br/><small>zero-copy channels</small>"]
+        Security["Sandbox<br/><small>permissions &#x2502; audit</small>"]
+        Virt["Virtualization<br/><small>VT-x &#x2502; EPT &#x2502; hypercalls</small>"]
+    end
+
+    subgraph Drivers["<b>Drivers</b>"]
+        direction LR
+        GPU["GPU Driver<br/><small>PCI detect &#x2502; dispatch</small>"]
+        BT["Bluetooth SPP<br/><small>HCI &#x2502; L2CAP &#x2502; RFCOMM</small>"]
+        Net["Network Stack<br/><small>ARP &#x2502; IPv4 &#x2502; UDP &#x2502; ICMP</small>"]
+        SD["SD / Block<br/><small>RPi SD &#x2502; virtio-blk</small>"]
+        FS["TensorFS<br/><small>AI-aware VFS</small>"]
+    end
+
+    subgraph Boot["<b>Boot</b>"]
+        direction LR
+        x86["x86_64 Multiboot2<br/><small>long mode &#x2502; SSE2 &#x2502; SIMD</small>"]
+        arm["ARM64 Boot Stub<br/><small>EL2→EL1 &#x2502; MMU &#x2502; UART</small>"]
+        SMP["SMP Bootstrap<br/><small>LAPIC / PSCI</small>"]
+    end
+
+    Userland --> Runtime
+    Runtime --> Kernel
+    Kernel --> Drivers
+    Drivers --> Boot
+
+    style Userland fill:#1a1a2e,stroke:#e94560,color:#fff
+    style Runtime fill:#16213e,stroke:#0f3460,color:#fff
+    style Kernel fill:#0f3460,stroke:#533483,color:#fff
+    style Drivers fill:#533483,stroke:#e94560,color:#fff
+    style Boot fill:#2c2c54,stroke:#474787,color:#fff
 ```
-┌────────────────────────────────────────────────────────────────────┐
-│                        AI Shell (aishell)                          │
-│  model load llama3 │ infer gpt4 "hello" │ deploy bert --port 8080 │
-├───────────┬────────┴───────┬──────────────┬───────────────────────┤
-│  Training │   Deployment   │   Monitor    │   Pseudocode JIT      │
-│  Service  │   Service      │   Daemon     │   Runtime             │
-├───────────┴────────────────┴──────────────┴───────────────────────┤
-│                     Tensor Execution Engine                        │
-│            (Eager ops, Compute Graphs, Auto-backend)              │
-├───────────────────────────────────────────────────────────────────┤
-│  Tensor     │  Memory      │  Native   │  Virtual-  │ Security   │
-│  Scheduler  │  Manager     │  Git      │  ization   │ Sandbox    │
-│  (MEU-based)│  (AI-aware)  │  (SHA-256)│  (VT-x)   │            │
-├─────────────┼──────────────┼───────────┼────────────┼────────────┤
-│  GPU Driver │  TPU Driver  │  TensorFS │  IPC       │ Model Pkg  │
-│  (NVIDIA/   │              │  (AI-aware│  (zero-    │ Manager    │
-│   AMD/Intel)│              │   VFS)    │   copy)    │            │
-├─────────────┴──────────────┴───────────┴────────────┴────────────┤
-│                     Multiboot2 Bootloader                         │
-│              (x86_64 Long Mode, Tensor Memory Regions)            │
-└───────────────────────────────────────────────────────────────────┘
+
+### Component Interaction
+
+```mermaid
+flowchart LR
+    A[AI Shell] -->|"model load"| B[Tensor Engine]
+    B -->|"dispatch ops"| C[Tensor Scheduler]
+    C -->|"GPU score"| D[GPU Driver]
+    C -->|"allocate"| E[Memory Manager]
+    B -->|"run inference"| F[NN Libs]
+    F -->|"speculative"| G[SNE Engine]
+    F -->|"quantized"| H[INT4/INT16]
+    A -->|"train bert"| I[Train Service]
+    I -->|"backprop"| F
+    A -->|"deploy"| J[Deploy Service]
+    A -->|"git commit"| K[Native Git]
+
+    style A fill:#e94560,stroke:#fff,color:#fff
+    style B fill:#0f3460,stroke:#fff,color:#fff
+    style F fill:#533483,stroke:#fff,color:#fff
+    style G fill:#533483,stroke:#fff,color:#fff
 ```
 
 ## Key Innovations
@@ -187,67 +252,76 @@ gdb -x .gdbinit build/tensoros.bin
 TensorOS/
 ├── boot/
 │   ├── boot.asm              # Multiboot2 bootloader (x86_64 long mode)
+│   ├── arm64/boot.S          # ARM64 boot stub (EL2→EL1, MMU, UART)
 │   └── linker.ld             # Linker script with tensor memory regions
 ├── kernel/
 │   ├── core/
 │   │   ├── kernel.h          # Core types (tensor_desc_t, MEU, kernel_state)
-│   │   └── main.c            # Kernel entry, 4-phase boot
+│   │   ├── main.c            # Kernel entry, 20-phase boot sequence
+│   │   ├── klib.c            # Platform HAL (UART, VGA, IDT, PIC, keyboard)
+│   │   ├── smp.c             # SMP multi-core bootstrap (LAPIC/PSCI)
+│   │   ├── perf.c            # Cycle-accurate performance counters
+│   │   ├── exception.c       # ARM64 exception vectors
+│   │   ├── watchdog.c        # Hardware watchdog timer
+│   │   ├── selftest.c        # Boot-time self-tests
+│   │   └── cpu_features.c    # CPUID / feature detection
 │   ├── sched/
-│   │   ├── tensor_sched.h    # Tensor-aware scheduler
 │   │   └── tensor_sched.c    # MEU scheduling, GPU scoring, batch coalescing
 │   ├── mm/
-│   │   ├── tensor_mm.h       # Memory manager
-│   │   └── tensor_mm.c       # Tensor heap, model cache, slab allocator
+│   │   ├── tensor_mm.c       # Tensor heap, model cache, slab allocator
+│   │   └── tensor_arena.c    # Zero-fragmentation arena allocator
 │   ├── drivers/
-│   │   ├── gpu/
-│   │   │   ├── gpu.h         # GPU driver interface
-│   │   │   └── gpu.c         # PCI detection, tensor op dispatch
-│   │   └── tpu/
-│   │       ├── tpu.h         # TPU driver interface
-│   │       └── tpu.c         # TPU driver stub
+│   │   ├── gpu/gpu.c         # PCI GPU detection, tensor op dispatch
+│   │   ├── tpu/tpu.c         # TPU driver stub
+│   │   ├── bt/rpi_bt.c       # Bluetooth SPP (PL011→HCI→L2CAP→RFCOMM)
+│   │   ├── blk/rpi_sd.c      # RPi4 SD card (EMMC2) driver
+│   │   ├── blk/virtio_blk.c  # Virtio block device driver
+│   │   ├── blk/sdlog.h       # FAT32 SD boot logger
+│   │   └── net/virtio_net.c  # Virtio network device driver
+│   ├── net/
+│   │   └── netstack.c        # ARP, IPv4, UDP, ICMP, HTTP inference server
 │   ├── fs/
-│   │   ├── git.h             # Native git (SHA-256, tensor objects)
-│   │   ├── git.c             # Git implementation
-│   │   ├── tensorfs.h        # AI-aware filesystem
-│   │   └── tensorfs.c        # TensorFS implementation
+│   │   ├── git.c             # Native kernel git (SHA-256, tensor objects)
+│   │   └── tensorfs.c        # AI-aware virtual filesystem
 │   ├── security/
-│   │   ├── sandbox.h         # Security sandbox
 │   │   └── sandbox.c         # Permissions, audit, deterministic mode
-│   └── ipc/
-│       ├── tensor_ipc.h      # Inter-MEU communication
-│       └── tensor_ipc.c      # Zero-copy channels, pipelines
+│   ├── ipc/
+│   │   └── tensor_ipc.c      # Zero-copy channels, tensor pipelines
+│   └── update/
+│       └── ota.c             # OTA firmware update (UART/BT)
 ├── virt/
-│   ├── virt.h                # Virtualization (VT-x, containers)
-│   └── virt.c                # EPT/NPT, GPU passthrough, hypercalls
+│   └── virt.c                # VT-x/EPT, GPU passthrough, hypercalls
 ├── runtime/
 │   ├── pseudocode/
-│   │   ├── pseudocode_jit.h  # Pseudocode language runtime
-│   │   └── pseudocode_jit.c  # Lexer, parser, IR, optimizer, interpreter
-│   └── tensor/
-│       ├── tensor_engine.h   # Tensor execution engine
-│       └── tensor_engine.c   # Eager ops, compute graphs, backend selection
+│   │   └── pseudocode_jit.c  # Lexer, parser, IR, 4-tier JIT, optimizer
+│   ├── tensor/
+│   │   ├── tensor_engine.c   # Eager ops, compute graphs, backend selection
+│   │   ├── tensor_cpu.c      # SIMD tensor ops (SSE2 / NEON)
+│   │   └── tensor_avx2.c     # AVX2-accelerated tensor kernels
+│   ├── jit/
+│   │   └── x86_jit.c         # x86_64 JIT code emitter
+│   └── nn/
+│       ├── inference.c        # Forward pass, model loading, benchmarks
+│       ├── train.c            # Backpropagation + Adam optimizer
+│       ├── quantize.c         # INT16 quantization engine
+│       ├── quantize4.c        # INT4 / Q4_K quantization engine
+│       ├── gguf.c             # GGUF model format parser + writer
+│       ├── speculative.c      # Speculative Neural Execution (5 techniques)
+│       ├── transformer.c      # Multi-head attention, transformer blocks
+│       └── evolution.c        # Neuroevolution with genetic algorithms
 ├── pkg/
-│   ├── modelpkg.h            # Model package manager
-│   └── modelpkg.c            # Registry, install, quantize, verify
+│   └── modelpkg.c            # Model package manager (registry, install)
 ├── userland/
-│   ├── shell/
-│   │   ├── aishell.h         # AI Shell
-│   │   └── aishell.c         # Interactive shell with AI commands
-│   ├── monitor/
-│   │   ├── tensor_monitor.h  # System monitor daemon
-│   │   └── tensor_monitor.c  # GPU/memory/MEU monitoring, alerts
-│   ├── deploy/
-│   │   ├── deploy_service.h  # Model deployment service
-│   │   └── deploy_service.c  # Auto-scaling, health checks, A/B testing
-│   └── train/
-│       ├── train_service.h   # Training service
-│       └── train_service.c   # Distributed training, checkpointing, LR scheduling
+│   ├── shell/aishell.c       # Interactive AI shell with 20+ commands
+│   ├── monitor/tensor_monitor.c  # GPU/memory/MEU monitoring, alerts
+│   ├── deploy/deploy_service.c   # Auto-scaling, health checks, A/B testing
+│   └── train/train_service.c     # Distributed training orchestration
 ├── scripts/
 │   ├── run-qemu.sh           # QEMU launcher (Linux/macOS)
 │   └── run-qemu.ps1          # QEMU launcher (Windows)
-├── Makefile                   # Build system
-├── .gdbinit                   # GDB configuration
-└── README.md                  # This file
+├── build_rpi.ps1             # ARM64 / RPi4 build script (Zig toolchain)
+├── Makefile                   # x86_64 build system
+└── README.md
 ```
 
 ---
@@ -290,22 +364,33 @@ Any text that isn't a built-in command is automatically JIT-compiled as Pseudoco
 
 ## Roadmap
 
-- [ ] Interrupt handler (IDT, PIC/APIC, timer)
-- [ ] Full PS/2 keyboard driver with scancode set 2
-- [ ] PCI Express enumeration for modern GPUs
+- [x] Interrupt handler (IDT, PIC/APIC, ARM64 exception vectors)
+- [x] PS/2 keyboard driver with scancode set 2
+- [x] PCI Express enumeration for GPUs
+- [x] Network stack (ARP/IPv4/UDP/ICMP + HTTP inference server)
+- [x] GGUF native loader (parse + round-trip)
+- [x] Model quantization engine (INT16 + INT4/Q4_K)
+- [x] Speculative Neural Execution (5 techniques)
+- [x] Backpropagation training engine (SGD + Adam)
+- [x] Neuroevolution engine (genetic algorithms)
+- [x] SMP multi-core bootstrap (LAPIC + PSCI)
+- [x] Bluetooth SPP serial console (HCI → L2CAP → RFCOMM)
+- [x] OTA firmware update (ARM64)
+- [x] Transformer architecture (multi-head attention)
+- [x] ARM64 / Raspberry Pi 4 port
+- [x] Arena allocator (zero-fragmentation tensor memory)
+- [x] SD card driver (RPi4 EMMC2)
 - [ ] NVIDIA GPU driver (MMIO register interface)
 - [ ] AMD ROCm-compatible GPU driver
 - [ ] Real DMA engine for PCIe transfers
-- [ ] Network stack (TCP/IP for model serving)
+- [ ] TCP transport for model serving
 - [ ] Distributed training across multiple machines
 - [ ] UEFI boot support
 - [ ] Filesystem persistence (disk I/O)
 - [ ] Pseudocode standard library
 - [ ] WebGPU/Vulkan compute backend
 - [ ] ONNX Runtime integration
-- [ ] safetensors / GGUF native loaders
-- [ ] Model quantization engine (GPTQ, AWQ, GGML)
-- [ ] Speculative decoding support
+- [ ] safetensors native loader
 - [ ] Flash Attention kernel
 - [ ] PagedAttention (vLLM-style) for serving
 
