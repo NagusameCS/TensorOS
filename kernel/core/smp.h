@@ -127,4 +127,9 @@ void smp_print_status(void);
  */
 void smp_run_demos(void);
 
+/**
+ * Get LAPIC timer tick count (for profiling).
+ */
+uint64_t smp_lapic_ticks(void);
+
 #endif /* TENSOROS_SMP_H */

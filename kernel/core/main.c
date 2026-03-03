@@ -514,6 +514,93 @@ write_fail:
 #ifndef __aarch64__
     smp_run_demos();
     kstate.cpu_count = smp.cpu_count;  /* Update with actual SMP count */
+
+    /* --- SMP Work Dispatch Test --- */
+    if (smp.ap_started > 0) {
+        kprintf("\n  --- SMP Work Dispatch Test ---\n");
+
+        /* Simple smoke test: dispatch to each AP and verify completion */
+        extern void smp_test_worker(void *arg);
+        volatile uint32_t smp_test_flag = 0;
+        for (uint32_t ap = 1; ap <= smp.ap_started; ap++) {
+            kprintf("  Dispatching to CPU %u...\n", ap);
+            smp_test_flag = 0;
+            __asm__ volatile ("mfence" ::: "memory");
+            int rc = smp_dispatch(ap, smp_test_worker, (void *)&smp_test_flag);
+            if (rc != 0) {
+                kprintf("  CPU %u dispatch FAILED (rc=%d)\n", ap, rc);
+                continue;
+            }
+            /* Wait with timeout (500ms = 500000 iterations of pause) */
+            volatile int wait_ok = 0;
+            for (uint64_t tries = 0; tries < 500000; tries++) {
+                if (smp.cpus[ap].work_done) { wait_ok = 1; break; }
+                __asm__ volatile ("pause");
+            }
+            smp.cpus[ap].state = CPU_STATE_IDLE; /* Reset state regardless */
+            if (wait_ok && smp_test_flag == 0xCAFE)
+                kprintf("  CPU %u dispatch: PASS\n", ap);
+            else if (wait_ok)
+                kprintf("  CPU %u dispatch: WRONG (got 0x%x)\n", ap, smp_test_flag);
+            else
+                kprintf("  CPU %u dispatch: TIMEOUT\n", ap);
+        }
+
+        /* --- SMP Parallel GEMM Benchmark --- */
+        kprintf("\n  --- SMP Parallel GEMM Benchmark ---\n");
+        {
+            #define SMP_BENCH_N 128
+            static float smp_A[SMP_BENCH_N * SMP_BENCH_N];
+            static float smp_B[SMP_BENCH_N * SMP_BENCH_N];
+            static float smp_C1[SMP_BENCH_N * SMP_BENCH_N];
+            static float smp_C2[SMP_BENCH_N * SMP_BENCH_N];
+
+            /* Initialize matrices */
+            for (int i = 0; i < SMP_BENCH_N * SMP_BENCH_N; i++) {
+                smp_A[i] = (float)(i % 17) * 0.1f;
+                smp_B[i] = (float)(i % 13) * 0.1f;
+            }
+
+            /* Single-core benchmark */
+            uint64_t t0 = rdtsc_fenced();
+            for (int rep = 0; rep < 5; rep++)
+                tensor_cpu_matmul(smp_C1, smp_A, smp_B, SMP_BENCH_N, SMP_BENCH_N, SMP_BENCH_N);
+            uint64_t t1 = rdtsc_fenced();
+            uint64_t single_us = perf_cycles_to_us(t1 - t0) / 5;
+            uint64_t single_flops = (uint64_t)2 * SMP_BENCH_N * SMP_BENCH_N * SMP_BENCH_N;
+            uint64_t single_mflops = single_us > 0 ? single_flops / single_us : 0;
+            kprintf("  Single-core %dx%d: %lu MFLOPS (%lu us)\n",
+                    SMP_BENCH_N, SMP_BENCH_N, single_mflops, single_us);
+
+            /* Multi-core benchmark */
+            t0 = rdtsc_fenced();
+            for (int rep = 0; rep < 5; rep++)
+                tensor_cpu_matmul_smp(smp_C2, smp_A, smp_B, SMP_BENCH_N, SMP_BENCH_N, SMP_BENCH_N);
+            t1 = rdtsc_fenced();
+            uint64_t multi_us = perf_cycles_to_us(t1 - t0) / 5;
+            uint64_t multi_mflops = multi_us > 0 ? single_flops / multi_us : 0;
+            kprintf("  SMP %u-core  %dx%d: %lu MFLOPS (%lu us)\n",
+                    smp.ap_started + 1, SMP_BENCH_N, SMP_BENCH_N, multi_mflops, multi_us);
+
+            /* Correctness check: compare single vs multi-core output */
+            int errors = 0;
+            for (int i = 0; i < SMP_BENCH_N * SMP_BENCH_N; i++) {
+                float diff = smp_C1[i] - smp_C2[i];
+                if (diff > 0.01f || diff < -0.01f) errors++;
+            }
+            if (errors == 0)
+                kprintf("  Correctness: PASS (single==multi)\n");
+            else
+                kprintf("  Correctness: FAIL (%d mismatches)\n", errors);
+
+            if (single_us > 0 && multi_us > 0) {
+                uint64_t speedup_x10 = (single_us * 10) / multi_us;
+                kprintf("  Speedup: %lu.%lux (%u cores)\n",
+                        speedup_x10 / 10, speedup_x10 % 10, smp.ap_started + 1);
+            }
+            #undef SMP_BENCH_N
+        }
+    }
 #else
     kprintf("  [OK] ARM64 PSCI multicore (4 Cortex-A72 cores)\n");
 #endif

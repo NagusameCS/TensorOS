@@ -330,12 +330,68 @@ static int slab_size_index(uint64_t size)
     return -1; /* Too large for slab */
 }
 
+/* Create a new slab page for a given size class.
+ * Each slab uses one 4K page: the slab_t header lives at the start,
+ * followed by as many objects as fit. Each free object stores a pointer
+ * to the next free object (freelist threading). */
+static slab_t *slab_create(int idx)
+{
+    uint64_t phys = phys_alloc_pages(1, 1);
+    if (phys == 0) return NULL;
+
+    slab_t *slab = (slab_t *)phys;
+    uint32_t obj_size = slab_sizes[idx];
+
+    /* Ensure obj_size can hold a pointer for freelist threading */
+    if (obj_size < sizeof(void *)) obj_size = sizeof(void *);
+
+    slab->obj_size = obj_size;
+    slab->next = slab_caches[idx];
+    slab_caches[idx] = slab;
+
+    /* Carve objects from the page, starting after the slab_t header */
+    uint8_t *base = (uint8_t *)slab + ((sizeof(slab_t) + obj_size - 1) & ~(obj_size - 1));
+    uint8_t *end = (uint8_t *)slab + MM_PAGE_SIZE_4K;
+    slab->free_list = NULL;
+    slab->total = 0;
+    slab->used = 0;
+
+    while (base + obj_size <= end) {
+        *(void **)base = slab->free_list;
+        slab->free_list = base;
+        slab->total++;
+        base += obj_size;
+    }
+
+    return slab;
+}
+
+/* Check if a pointer falls within a slab page */
+static bool ptr_in_slab(slab_t *slab, void *ptr)
+{
+    uint64_t slab_base = (uint64_t)slab;
+    uint64_t addr = (uint64_t)ptr;
+    return addr >= slab_base && addr < slab_base + MM_PAGE_SIZE_4K;
+}
+
 void *kmalloc(uint64_t size)
 {
     int idx = slab_size_index(size);
-    if (idx >= 0 && slab_caches[idx]) {
+    if (idx >= 0) {
+        /* Walk slab chain looking for a slab with free objects */
         slab_t *slab = slab_caches[idx];
-        if (slab->free_list) {
+        while (slab) {
+            if (slab->free_list) {
+                void *obj = slab->free_list;
+                slab->free_list = *(void **)obj;
+                slab->used++;
+                return obj;
+            }
+            slab = slab->next;
+        }
+        /* No free objects — create a new slab page */
+        slab = slab_create(idx);
+        if (slab && slab->free_list) {
             void *obj = slab->free_list;
             slab->free_list = *(void **)obj;
             slab->used++;
@@ -363,17 +419,25 @@ void kfree(void *ptr)
     if (!ptr) return;
     uint64_t addr = (uint64_t)ptr;
 
-    /* Check if it's a slab allocation */
+    /* Check if it's a slab allocation — walk each size class chain */
     for (int si = 0; si < SLAB_SIZES; si++) {
-        if (!slab_caches[si]) continue;
-        /* Slab pages live in a known range; for simplicity, check size class free list */
-        /* Push back onto slab free list */
+        slab_t *slab = slab_caches[si];
+        while (slab) {
+            if (ptr_in_slab(slab, ptr)) {
+                /* Return object to this slab's free list */
+                *(void **)ptr = slab->free_list;
+                slab->free_list = ptr;
+                if (slab->used > 0) slab->used--;
+                return;
+            }
+            slab = slab->next;
+        }
     }
 
     /* Check page allocation tracker */
     for (int i = 0; i < kfree_track_count; i++) {
         if (kfree_track[i].addr == addr) {
-            phys_free_pages(addr / MM_PAGE_SIZE_4K, kfree_track[i].pages);
+            phys_free_pages(addr, kfree_track[i].pages);
             kfree_track[i] = kfree_track[--kfree_track_count];
             return;
         }
@@ -566,4 +630,147 @@ void tensor_mm_get_stats(mm_stats_t *stats)
     stats->tensor_heap_used = tensor_heap_used;
     stats->model_cache_size = model_cache.max_size;
     stats->model_cache_used = model_cache.total_size;
+}
+
+/* =============================================================================
+ * Virtual Memory: 4K Page Mapping
+ *
+ * The boot loader identity-maps 4GB using 2MB huge pages.
+ * This module can "split" a 2MB huge page into 512 × 4K pages and then
+ * individually control each 4K mapping.  Primary use: demand paging for
+ * model weights &mdash; fault on first access, allocate physical page, map it,
+ * and resume.
+ *
+ * Page table layout (set up by multiboot_stub.asm):
+ *   PML4   @ 0x1000
+ *   PDPT   @ 0x2000
+ *   PD0-3  @ 0x3000-0x6000  (each PD covers 1GB with 512 × 2MB entries)
+ * =============================================================================*/
+
+#define PT_PRESENT   0x001ULL
+#define PT_WRITE     0x002ULL
+#define PT_USER      0x004ULL
+#define PT_HUGE      0x080ULL  /* 2MB page in PD entry */
+#define PT_NX        (1ULL << 63)
+#define PT_ADDR_MASK 0x000FFFFFFFFFF000ULL
+
+/* Pool of pre-allocated 4K page table pages for splitting huge pages */
+#define VM_PT_POOL_MAX 16
+static uint64_t vm_pt_pool[VM_PT_POOL_MAX]; /* physical addresses of PT pages */
+static int vm_pt_pool_count = 0;
+
+/* Split a 2MB huge page into 512 × 4K pages.
+ * Returns the physical address of the new page table, or 0 on failure. */
+static uint64_t vm_split_huge_page(uint64_t huge_phys_base)
+{
+    /* Allocate a page for the new page table */
+    uint64_t pt_phys;
+    if (vm_pt_pool_count > 0) {
+        pt_phys = vm_pt_pool[--vm_pt_pool_count];
+    } else {
+        pt_phys = phys_alloc_pages(1, 1);
+        if (pt_phys == 0) return 0;
+    }
+
+    /* Fill 512 4K entries mapping the same 2MB region */
+    volatile uint64_t *pt = (volatile uint64_t *)(uintptr_t)pt_phys;
+    for (int i = 0; i < 512; i++) {
+        pt[i] = (huge_phys_base + (uint64_t)i * 4096) | PT_PRESENT | PT_WRITE;
+    }
+
+    return pt_phys;
+}
+
+/* Map a single 4K page: vaddr → paddr with given flags.
+ * If the PD entry is still a 2MB huge page, splits it first.
+ * Returns 0 on success, -1 on failure. */
+int vm_map_4k(uint64_t vaddr, uint64_t paddr, uint64_t flags)
+{
+    /* Only works within first 4GB identity-mapped region */
+    if (vaddr >= 0x100000000ULL) return -1;
+
+    /* Navigate page tables */
+    uint64_t pd_index  = (vaddr >> 21) & 0x1FF;    /* Which 2MB slot */
+    uint64_t gb_index  = (vaddr >> 30) & 0x3;       /* Which GB (0-3) */
+    uint64_t pt_index  = (vaddr >> 12) & 0x1FF;     /* Which 4K slot within 2MB */
+
+    /* PD base addresses: 0x3000 + gb_index * 0x1000 */
+    volatile uint64_t *pd = (volatile uint64_t *)(uintptr_t)(0x3000 + gb_index * 0x1000);
+    uint64_t pd_entry = pd[pd_index];
+
+    volatile uint64_t *pt;
+
+    if (pd_entry & PT_HUGE) {
+        /* Split the 2MB huge page */
+        uint64_t huge_phys = pd_entry & 0x000FFFFFFFE00000ULL; /* 2MB-aligned phys addr */
+        uint64_t pt_phys = vm_split_huge_page(huge_phys);
+        if (pt_phys == 0) return -1;
+
+        /* Replace PD entry: point to new PT, remove HUGE flag */
+        pd[pd_index] = pt_phys | PT_PRESENT | PT_WRITE;
+
+        /* Invalidate TLB for the entire 2MB region */
+        for (int i = 0; i < 512; i++) {
+            uint64_t inv_addr = (gb_index << 30) | (pd_index << 21) | ((uint64_t)i << 12);
+            __asm__ volatile ("invlpg (%0)" : : "r"(inv_addr) : "memory");
+        }
+
+        pt = (volatile uint64_t *)(uintptr_t)pt_phys;
+    } else if (pd_entry & PT_PRESENT) {
+        /* Already split — get existing PT */
+        pt = (volatile uint64_t *)(uintptr_t)(pd_entry & PT_ADDR_MASK);
+    } else {
+        return -1; /* PD entry not present */
+    }
+
+    /* Set the 4K page table entry */
+    pt[pt_index] = (paddr & PT_ADDR_MASK) | flags;
+
+    /* Invalidate TLB for this page */
+    __asm__ volatile ("invlpg (%0)" : : "r"(vaddr) : "memory");
+
+    return 0;
+}
+
+/* Unmap a 4K page (set entry to not-present). */
+void vm_unmap_4k(uint64_t vaddr)
+{
+    if (vaddr >= 0x100000000ULL) return;
+
+    uint64_t pd_index = (vaddr >> 21) & 0x1FF;
+    uint64_t gb_index = (vaddr >> 30) & 0x3;
+    uint64_t pt_index = (vaddr >> 12) & 0x1FF;
+
+    volatile uint64_t *pd = (volatile uint64_t *)(uintptr_t)(0x3000 + gb_index * 0x1000);
+    uint64_t pd_entry = pd[pd_index];
+
+    if ((pd_entry & PT_PRESENT) && !(pd_entry & PT_HUGE)) {
+        volatile uint64_t *pt = (volatile uint64_t *)(uintptr_t)(pd_entry & PT_ADDR_MASK);
+        pt[pt_index] = 0; /* Not present */
+        __asm__ volatile ("invlpg (%0)" : : "r"(vaddr) : "memory");
+    }
+}
+
+/* Handle a demand-page fault: allocate a physical page, map it, return success.
+ * Returns 0 if the fault was handled (caller should IRETQ), -1 if not ours. */
+int vm_demand_fault(uint64_t fault_addr)
+{
+    /* Only handle faults in the upper 2-3 GB range (where model data lives) */
+    if (fault_addr < 0x40000000ULL || fault_addr >= 0x100000000ULL) return -1;
+
+    /* Allocate a physical page */
+    uint64_t phys = phys_alloc_pages(1, 1);
+    if (phys == 0) return -1;
+
+    /* Zero it */
+    kmemset((void *)(uintptr_t)phys, 0, 4096);
+
+    /* Map it at the faulting address (4K-aligned) */
+    uint64_t page_addr = fault_addr & ~0xFFFULL;
+    if (vm_map_4k(page_addr, phys, PT_PRESENT | PT_WRITE) != 0) {
+        phys_free_pages(phys, 1);
+        return -1;
+    }
+
+    return 0;
 }

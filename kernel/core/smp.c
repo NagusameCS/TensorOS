@@ -74,7 +74,7 @@ static void smp_delay_us(uint32_t us)
  * =============================================================================*/
 
 /* AP stack: each AP gets an 8KB stack */
-#define AP_STACK_SIZE 8192
+#define AP_STACK_SIZE 32768   /* 32 KB per AP (needs headroom for GEMM, ISRs) */
 static uint8_t ap_stacks[MAX_CPUS][AP_STACK_SIZE] __attribute__((aligned(16)));
 
 /* AP entry flag - set by each AP when it reaches C code */
@@ -159,9 +159,18 @@ static const uint8_t trampoline_code[] = {
     /* Relative address to flag - will be patched */
     0x00, 0x00, 0x00, 0x00,
 
-    /* Halt - AP will be managed by BSP */
-    0xFA,                         /* cli (no IDT on AP, avoid interrupt faults) */
-    0xEB, 0xFE,                   /* jmp $ (tight infinite loop, NMI-safe) */
+    /* Load per-AP stack from trampoline page offset 0xB0 (patched by BSP) */
+    0x48, 0x8B, 0x24, 0x25,      /* mov rsp, [abs32] */
+    0xB0, 0x80, 0x00, 0x00,      /* address = 0x80B0 */
+
+    /* Load IDT from BSP's IDTR (at trampoline page offset 0x100, patched) */
+    0x0F, 0x01, 0x1C, 0x25,      /* lidt [abs32] */
+    0x00, 0x81, 0x00, 0x00,      /* address = 0x8100 */
+
+    /* Jump to C ap_idle_loop function (address at offset 0xA8, patched) */
+    0x48, 0x8B, 0x04, 0x25,      /* mov rax, [abs32] */
+    0xA8, 0x80, 0x00, 0x00,      /* address = 0x80A8 */
+    0xFF, 0xE0,                   /* jmp rax */
 };
 
 /* GDT for trampoline (at offset 0xD0 in trampoline page) */
@@ -183,6 +192,128 @@ static const uint8_t trampoline_gdt[] = {
     /* Entry 4 (0x20): 64-bit data */
     0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
 };
+
+/* =============================================================================
+ * AP Idle Loop — runs on each Application Processor after boot
+ *
+ * Each AP enables interrupts and spins waiting for work. When the BSP
+ * calls smp_dispatch(), it sets work_ready=1 and sends an IPI (vector 0xFE).
+ * The AP sees work_ready, calls the work function, sets work_done=1, and
+ * resumes spinning. This gives us near-zero-latency work dispatch with
+ * no OS scheduler overhead — perfect for parallel tensor operations.
+ * =============================================================================*/
+
+/* IPI work notification handler (vector 0xFE).
+ * This interrupt breaks the HLT in the idle loop. The actual work check
+ * happens in the main loop — the ISR just needs to return. */
+extern void isr_smp_work(void);
+__asm__(
+    ".globl isr_smp_work\n"
+    ".type isr_smp_work, @function\n"
+    "isr_smp_work:\n"
+    "  push %rax\n"
+    "  mov %cr8, %rax\n"         /* Save TPR */
+    "  push %rax\n"
+    /* Send EOI to LAPIC (MMIO write to LAPIC_BASE + 0xB0) */
+    "  movq smp(%rip), %rax\n"   /* smp.lapic_base (first field of smp_state_t) */
+    "  movl $0, 0xB0(%rax)\n"   /* LAPIC EOI register */
+    "  pop %rax\n"
+    "  mov %rax, %cr8\n"        /* Restore TPR */
+    "  pop %rax\n"
+    "  iretq\n"
+);
+
+/* BSP's GDTR, saved so APs can reload the kernel GDT.
+ * The trampoline GDT has selector 0x08 = 32-bit code, but IDT gates use
+ * selector 0x08 which must be 64-bit code.  After the AP enters long mode
+ * through the trampoline, it must switch to the kernel GDT. */
+static uint8_t bsp_gdtr[10] __attribute__((aligned(16)));
+
+/* The AP idle loop: called from trampoline after reaching long mode */
+void ap_idle_loop(void)
+{
+    /* ---- Reload the kernel GDT (critical!) ----
+     * The trampoline GDT has selector 0x08 as a 32-bit code segment (needed
+     * for real-mode → protected-mode transition).  But IDT gates use selector
+     * 0x08 for 64-bit code.  If we take an interrupt with the trampoline GDT
+     * still loaded, the CPU loads CS=0x08 = 32-bit code → triple fault.
+     *
+     * Fix: LGDT the kernel's GDT (saved by BSP in smp_init), then reload
+     * CS via a far-return and set data segments to kernel data selector. */
+    __asm__ volatile (
+        "lgdt %0\n"
+        : : "m"(*(uint8_t(*)[10])bsp_gdtr) : "memory"
+    );
+    /* Reload CS: push kernel CS (0x08), push return address, lretq */
+    __asm__ volatile (
+        "pushq $0x08\n"
+        "leaq 1f(%%rip), %%rax\n"
+        "pushq %%rax\n"
+        "lretq\n"
+        "1:\n"
+        /* Reload data segment registers with kernel data selector (0x10) */
+        "mov $0x10, %%ax\n"
+        "mov %%ax, %%ds\n"
+        "mov %%ax, %%es\n"
+        "mov %%ax, %%fs\n"
+        "mov %%ax, %%gs\n"
+        "mov %%ax, %%ss\n"
+        : : : "rax", "memory"
+    );
+
+    /* Enable SSE/SSE2 on this AP (trampoline doesn't set these).
+     * CR0: clear EM (bit 2), set MP (bit 1)
+     * CR4: set OSFXSR (bit 9), OSXMMEXCPT (bit 10) */
+    __asm__ volatile (
+        "mov %%cr0, %%rax\n"
+        "and $~(1<<2), %%eax\n"   /* clear EM */
+        "or  $(1<<1),  %%eax\n"   /* set MP  */
+        "mov %%rax, %%cr0\n"
+        "mov %%cr4, %%rax\n"
+        "or  $((1<<9)|(1<<10)), %%eax\n"  /* OSFXSR + OSXMMEXCPT */
+        "mov %%rax, %%cr4\n"
+        : : : "rax"
+    );
+
+    /* Identify which CPU we are by reading LAPIC ID */
+    uint32_t my_apic_id = lapic_read(LAPIC_ID) >> 24;
+    uint32_t my_cpu = 0;
+    for (uint32_t i = 0; i < smp.cpu_count; i++) {
+        if (smp.cpus[i].apic_id == my_apic_id) {
+            my_cpu = i;
+            break;
+        }
+    }
+
+    /* Enable LAPIC on this AP (set spurious interrupt vector, enable bit) */
+    lapic_write(LAPIC_SVR, 0x1FF);  /* Enable + spurious vector 0xFF */
+
+    /* Enable interrupts so we can receive the work IPI */
+    __asm__ volatile ("sti");
+
+    /* Spin forever: check for work, execute, signal done */
+    for (;;) {
+        /* Memory fence before checking work_ready */
+        __asm__ volatile ("mfence" ::: "memory");
+
+        if (smp.cpus[my_cpu].work_ready) {
+            smp.cpus[my_cpu].work_ready = 0;
+            __asm__ volatile ("mfence" ::: "memory");
+
+            /* Execute the work function */
+            if (smp.cpus[my_cpu].work_fn) {
+                smp.cpus[my_cpu].work_fn(smp.cpus[my_cpu].work_arg);
+            }
+
+            /* Signal completion */
+            __asm__ volatile ("mfence" ::: "memory");
+            smp.cpus[my_cpu].work_done = 1;
+        }
+
+        /* Sleep until next interrupt (IPI will wake us) */
+        __asm__ volatile ("hlt");
+    }
+}
 
 /* =============================================================================
  * Install trampoline at 0x8000
@@ -212,6 +343,17 @@ static void install_trampoline(void)
      * displacement = &ap_running_flag - 0x8082 */
     int32_t *disp = (int32_t *)(tramp + 0x7E);
     *disp = (int32_t)((uintptr_t)&ap_running_flag - (uintptr_t)(tramp + 0x82));
+
+    /* Patch offset 0xA8: address of ap_idle_loop (64-bit) */
+    *(uint64_t *)(tramp + 0xA8) = (uint64_t)(uintptr_t)ap_idle_loop;
+
+    /* Patch offset 0x100: BSP's IDTR so APs can handle interrupts.
+     * Read current IDTR via SIDT — avoids static linkage issues. */
+    uint8_t idtr_buf[10];
+    __asm__ volatile ("sidt %0" : "=m"(*(uint8_t (*)[10])idtr_buf));
+    kmemcpy(tramp + 0x100, idtr_buf, 10);
+
+    /* Offset 0xB0 (AP stack) is patched per-AP in smp_init before each SIPI */
 }
 
 /* =============================================================================
@@ -290,6 +432,97 @@ static void lapic_init(void)
 }
 
 /* =============================================================================
+ * LAPIC Timer Calibration & Setup
+ *
+ * Calibrates the LAPIC timer against a known time reference (PIT countdown).
+ * Once calibrated, programs the LAPIC timer in periodic mode at 1000 Hz
+ * for per-CPU tick counting — essential for profiling SMP performance.
+ * =============================================================================*/
+
+/* Per-CPU LAPIC tick counter (BSP only for now) */
+static volatile uint64_t lapic_tick_count = 0;
+static uint32_t lapic_ticks_per_ms = 0;
+
+/* LAPIC timer ISR (vector 0xFD) — minimal: increment tick, send EOI */
+extern void isr_lapic_timer(void);
+__asm__(
+    ".globl isr_lapic_timer\n"
+    ".type isr_lapic_timer, @function\n"
+    "isr_lapic_timer:\n"
+    "  push %rax\n"
+    "  push %rdx\n"
+    "  lock incq lapic_tick_count(%rip)\n"
+    /* Send LAPIC EOI */
+    "  movq smp(%rip), %rax\n"      /* smp.lapic_base */
+    "  movl $0, 0xB0(%rax)\n"       /* LAPIC EOI */
+    "  pop %rdx\n"
+    "  pop %rax\n"
+    "  iretq\n"
+);
+
+/* Calibrate LAPIC timer: count how many LAPIC ticks pass in 10ms (via PIT) */
+static void lapic_timer_calibrate(void)
+{
+    /* Program PIT channel 2 for 10ms one-shot
+     * PIT frequency = 1193182 Hz, so 10ms = 11932 ticks */
+    const uint16_t pit_10ms = 11932;
+
+    /* LAPIC timer: divide by 16, one-shot, start with max count */
+    lapic_write(LAPIC_TIMER_DIV, 0x03);  /* Divide by 16 */
+    lapic_write(LAPIC_TIMER_LVT, 0x10000); /* Masked (disabled) for calibration */
+
+    /* Setup PIT channel 2 in hardware retriggerable one-shot */
+    outb(0x43, 0xB0);  /* Channel 2, lobyte/hibyte, mode 0 (interrupt on terminal count) */
+    outb(0x42, (uint8_t)(pit_10ms & 0xFF));
+    outb(0x42, (uint8_t)(pit_10ms >> 8));
+
+    /* Start LAPIC timer counting down from 0xFFFFFFFF */
+    lapic_write(LAPIC_TIMER_ICR, 0xFFFFFFFF);
+
+    /* Gate PIT channel 2 on */
+    uint8_t gate = inb(0x61);
+    outb(0x61, (gate & 0xFC) | 0x01);
+
+    /* Wait for PIT to count down (poll bit 5 of port 0x61) */
+    while (!(inb(0x61) & 0x20))
+        __asm__ volatile ("pause");
+
+    /* Stop LAPIC timer */
+    lapic_write(LAPIC_TIMER_LVT, 0x10000); /* Mask to stop */
+
+    /* Read how many LAPIC ticks elapsed */
+    uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CCR);
+
+    /* LAPIC ticks per ms = elapsed / 10 */
+    lapic_ticks_per_ms = elapsed / 10;
+
+    kprintf("[SMP] LAPIC timer: %u ticks/ms (calibrated via PIT 10ms)\n",
+            lapic_ticks_per_ms);
+}
+
+/* Start LAPIC timer in periodic mode at 1000 Hz */
+static void lapic_timer_start(void)
+{
+    if (lapic_ticks_per_ms == 0) return;
+
+    extern void idt_set_gate(int num, uint64_t handler);
+    idt_set_gate(0xFD, (uint64_t)(uintptr_t)isr_lapic_timer);
+
+    lapic_write(LAPIC_TIMER_DIV, 0x03);  /* Divide by 16 */
+    /* Periodic mode (bit 17), vector 0xFD, not masked */
+    lapic_write(LAPIC_TIMER_LVT, 0x200FD);
+    lapic_write(LAPIC_TIMER_ICR, lapic_ticks_per_ms); /* 1 ms period = 1000 Hz */
+
+    kprintf("[SMP] LAPIC timer running at 1000 Hz (vector 0xFD)\n");
+}
+
+/* Get LAPIC tick count (for profiling) */
+uint64_t smp_lapic_ticks(void)
+{
+    return lapic_tick_count;
+}
+
+/* =============================================================================
  * Send IPI (Inter-Processor Interrupt)
  * =============================================================================*/
 
@@ -321,17 +554,34 @@ void smp_init(void)
         return;
     }
 
+    /* Save BSP's GDTR so APs can reload the kernel GDT */
+    __asm__ volatile ("sgdt %0" : "=m"(*(uint8_t(*)[10])bsp_gdtr));
+
     /* Initialize BSP LAPIC */
     lapic_init();
 
+    /* Calibrate and start LAPIC timer */
+    lapic_timer_calibrate();
+    lapic_timer_start();
+
     /* Install AP trampoline at 0x8000 */
     install_trampoline();
+
+    /* Install IPI work notification handler (vector 0xFE) in IDT */
+    extern void idt_set_gate(int num, uint64_t handler);
+    idt_set_gate(0xFE, (uint64_t)(uintptr_t)isr_smp_work);
 
     kprintf("[SMP] Starting %u Application Processors...\n", smp.cpu_count - 1);
 
     for (uint32_t i = 1; i < smp.cpu_count; i++) {
         uint8_t target_id = smp.cpus[i].apic_id;
         smp.cpus[i].state = CPU_STATE_BOOTING;
+
+        /* Patch per-AP stack pointer at trampoline offset 0xB0.
+         * Stack grows down, so set RSP to top of the AP's stack. */
+        uint8_t *tramp = (uint8_t *)(uintptr_t)TRAMPOLINE_ADDR;
+        uint64_t stack_top = (uint64_t)(uintptr_t)&ap_stacks[i][AP_STACK_SIZE];
+        *(uint64_t *)(tramp + 0xB0) = stack_top;
 
         uint32_t prev_count = ap_running_flag;
 
@@ -373,6 +623,14 @@ void smp_init(void)
     kprintf("[SMP] %u/%u APs started\n", smp.ap_started, smp.cpu_count - 1);
 }
 
+/* Simple SMP dispatch test worker — writes 0xCAFE to the flag */
+void smp_test_worker(void *arg)
+{
+    volatile uint32_t *flag = (volatile uint32_t *)arg;
+    *flag = 0xCAFE;
+    __asm__ volatile ("mfence" ::: "memory");
+}
+
 /* =============================================================================
  * Work dispatch
  * =============================================================================*/
@@ -389,9 +647,11 @@ int smp_dispatch(uint32_t cpu_id, smp_work_fn_t fn, void *arg)
     smp.cpus[cpu_id].work_ready = 1;
     smp.cpus[cpu_id].state = CPU_STATE_BUSY;
 
-    /* Send IPI to wake the AP (vector 0xFE = work notification) */
+    /* Send IPI to wake the AP (vector 0xFE = work notification).
+     * For Fixed delivery mode, Level must be Assert (bit 14) and
+     * Trigger must be Edge (bit 15 = 0) per Intel SDM Vol 3A §10.6.1. */
     if (cpu_id > 0) {
-        lapic_send_ipi(smp.cpus[cpu_id].apic_id, 0xFE);
+        lapic_send_ipi(smp.cpus[cpu_id].apic_id, 0xFE | ICR_LEVEL_ASSERT);
     }
 
     return 0;

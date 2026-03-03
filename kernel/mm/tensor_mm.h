@@ -154,4 +154,9 @@ uint64_t tensor_mm_cache_size(void);
 uint64_t tensor_mm_free_bytes(void);
 void     tensor_mm_get_stats(mm_stats_t *stats);
 
+/* Virtual Memory: 4K page mapping (splits 2MB huge pages on demand) */
+int  vm_map_4k(uint64_t vaddr, uint64_t paddr, uint64_t flags);
+void vm_unmap_4k(uint64_t vaddr);
+int  vm_demand_fault(uint64_t fault_addr); /* Returns 0 if handled, -1 if not */
+
 #endif /* TENSOROS_TENSOR_MM_H */

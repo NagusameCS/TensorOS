@@ -20,6 +20,7 @@
  * =============================================================================*/
 
 #include "kernel/core/kernel.h"
+#include "kernel/mm/tensor_mm.h"
 
 /* =============================================================================
  * Exception Frame
@@ -157,6 +158,22 @@ void exception_handler_c(exception_frame_t *frame, uint64_t cr2)
     __asm__ volatile("cli");
 
     uint64_t vec = frame->vector;
+
+    /* =================================================================
+     * Recoverable Page Fault: try demand-paging before panicking.
+     * If vm_demand_fault() succeeds, re-enable interrupts and RETURN
+     * so the faulting instruction is retried with the new mapping.
+     * =================================================================*/
+    if (vec == 14) {
+        /* Only attempt demand-page for not-present faults (error_code bit 0 = 0) */
+        if (!(frame->error_code & 1)) {
+            if (vm_demand_fault(cr2) == 0) {
+                __asm__ volatile("sti");
+                return;  /* Back to exception_common → iretq → retry */
+            }
+        }
+    }
+
     const char *name = (vec < 32) ? exception_names[vec] : "Unknown Exception";
 
     kprintf("\n");
