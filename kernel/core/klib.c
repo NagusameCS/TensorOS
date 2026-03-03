@@ -85,10 +85,11 @@ static void vga_puts(const char *s)
 
 /* Also output to serial port COM1 (0x3F8) for QEMU -serial stdio */
 #if defined(__aarch64__)
-/* ARM64: Serial output via PL011 UART + Bluetooth SPP mirror */
+/* ARM64: Serial output via mini UART + Bluetooth SPP mirror + HDMI framebuffer */
+#include "kernel/drivers/gpu/rpi_fb.h"
 static void serial_init(void) { /* Already done in vga_init() */ }
-static void serial_putchar(char c) { uart_putchar(c); bt_putchar(c); }
-static void serial_puts(const char *s) { uart_puts(s); while (*s) bt_putchar(*s++); }
+static void serial_putchar(char c) { uart_putchar(c); bt_putchar(c); fb_putchar(c); }
+static void serial_puts(const char *s) { uart_puts(s); while (*s) { bt_putchar(*s); fb_putchar(*s); s++; } }
 #else
 #define COM1 0x3F8
 
@@ -418,35 +419,105 @@ void kpanic(const char *msg)
 }
 
 /* =============================================================================
- * Memory Utilities
+ * Memory Utilities — Architecture-Optimized
+ *
+ * Uses x86_64 REP STOSB/MOVSB (Enhanced REP MOVSB on modern CPUs).
+ * ERMS is available on Ivy Bridge+ and provides ~32 bytes/cycle throughput,
+ * compared to ~1 byte/cycle for the naive loop. For large copies the CPU
+ * microcode uses 256-bit internal stores, matching or beating SSE2/AVX2.
+ *
+ * Fallback: for very small sizes (<= 64 bytes) we use direct 8-byte stores
+ * which avoid the REP setup overhead (~35 cycles).
  * =============================================================================*/
 
 void *kmemset(void *s, int c, size_t n)
 {
-    uint8_t *p = (uint8_t *)s;
-    while (n--)
-        *p++ = (uint8_t)c;
+#ifndef __aarch64__
+    /* Fast path: small fills with 8-byte stores */
+    if (n <= 64) {
+        uint8_t *p = (uint8_t *)s;
+        while (n >= 8) {
+            uint64_t fill8 = (uint8_t)c * 0x0101010101010101ULL;
+            *(uint64_t *)p = fill8;
+            p += 8; n -= 8;
+        }
+        while (n--) *p++ = (uint8_t)c;
+        return s;
+    }
+    /* REP STOSB: RDI=dest, RCX=count, AL=value */
+    __asm__ volatile (
+        "rep stosb"
+        : "+D"(s), "+c"(n)
+        : "a"((uint8_t)c)
+        : "memory"
+    );
     return s;
+#else
+    uint8_t *p = (uint8_t *)s;
+    while (n--) *p++ = (uint8_t)c;
+    return s;
+#endif
 }
 
 void *kmemcpy(void *dest, const void *src, size_t n)
 {
+#ifndef __aarch64__
+    void *ret = dest;
+    /* Fast path: small copies with 8-byte loads/stores */
+    if (n <= 64) {
+        uint8_t *d = (uint8_t *)dest;
+        const uint8_t *s = (const uint8_t *)src;
+        while (n >= 8) {
+            *(uint64_t *)d = *(const uint64_t *)s;
+            d += 8; s += 8; n -= 8;
+        }
+        while (n--) *d++ = *s++;
+        return ret;
+    }
+    /* REP MOVSB: RDI=dest, RSI=src, RCX=count (direction flag clear by ABI) */
+    __asm__ volatile (
+        "rep movsb"
+        : "+D"(dest), "+S"(src), "+c"(n)
+        :
+        : "memory"
+    );
+    return ret;
+#else
     uint8_t *d = (uint8_t *)dest;
     const uint8_t *s = (const uint8_t *)src;
-    while (n--)
-        *d++ = *s++;
+    while (n--) *d++ = *s++;
     return dest;
+#endif
 }
 
 /* Standard libc symbols — compiler may emit calls at -O2 */
 void *memcpy(void *dest, const void *src, size_t n)  { return kmemcpy(dest, src, n); }
 void *memset(void *s, int c, size_t n)               { return kmemset(s, c, n); }
 void *memmove(void *dest, const void *src, size_t n) {
+#ifndef __aarch64__
+    if (dest == src || n == 0) return dest;
+    if ((uint8_t *)dest < (const uint8_t *)src) {
+        return kmemcpy(dest, src, n);
+    }
+    /* Backward copy: set direction flag, use REP MOVSB backward */
+    uint8_t *d = (uint8_t *)dest + n - 1;
+    const uint8_t *s2 = (const uint8_t *)src + n - 1;
+    __asm__ volatile (
+        "std\n\t"
+        "rep movsb\n\t"
+        "cld"
+        : "+D"(d), "+S"(s2), "+c"(n)
+        :
+        : "memory"
+    );
+    return dest;
+#else
     uint8_t *d = (uint8_t *)dest;
     const uint8_t *s2 = (const uint8_t *)src;
     if (d < s2) { while (n--) *d++ = *s2++; }
     else { d += n; s2 += n; while (n--) *--d = *--s2; }
     return dest;
+#endif
 }
 int memcmp(const void *a, const void *b, size_t n) {
     const uint8_t *p = a, *q = b;

@@ -17,11 +17,8 @@
 
 #include <stdint.h>
 
-/* Forward-declare fb_init / fb_putchar / fb_puts — defined in rpi_fb.h,
- * which is included AFTER the mailbox helpers below. */
-static inline int  fb_init(void);
-static inline void fb_putchar(char c);
-static inline void fb_puts(const char *s);
+/* HDMI framebuffer console — real implementation in kernel/drivers/gpu/rpi_fb.c.
+ * Declarations available via kernel/drivers/gpu/rpi_fb.h (included below). */
 
 /* =============================================================================
  * BCM2711 Peripheral Base Addresses
@@ -352,7 +349,7 @@ static inline uint32_t rpi_get_board_revision(void) {
     return 0;
 }
 
-/* Include HDMI framebuffer console (depends on mbox_call above) */
-#include "kernel/arch/arm64/rpi_fb.h"
+/* Include HDMI framebuffer console declarations */
+#include "kernel/drivers/gpu/rpi_fb.h"
 
 #endif /* TENSOROS_ARM64_HAL_H */

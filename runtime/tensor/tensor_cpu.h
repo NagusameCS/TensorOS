@@ -92,4 +92,9 @@ int   tensor_cpu_argmax(const float *x, int n);
 /* Verify: run a small self-test and return 0 on success */
 int tensor_cpu_selftest(void);
 
+/* SMP Parallel GEMM: splits M dimension across CPU cores.
+ * Falls back to tensor_cpu_matmul when ncpus <= 1 or M < 64. */
+void tensor_cpu_matmul_smp(float *C, const float *A, const float *B,
+                           int M, int N, int K);
+
 #endif /* TENSOROS_TENSOR_CPU_H */

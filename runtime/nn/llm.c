@@ -1338,19 +1338,19 @@ static int llm_format_prompt(const llm_model_t *m, const char *question,
 
     if (is_chatml) {
         /* ChatML format (Qwen, SmolLM, Mistral-Instruct-v0.3+, etc.) */
-        pos += kstrcpy(buf + pos, "<|im_start|>system\nYou are a helpful math assistant. Give only the numeric answer.<|im_end|>\n<|im_start|>user\n");
-        pos += kstrcpy(buf + pos, question);
-        pos += kstrcpy(buf + pos, "<|im_end|>\n<|im_start|>assistant\n");
+        { const char *t = "<|im_start|>system\nYou are a helpful math assistant. Give only the numeric answer.<|im_end|>\n<|im_start|>user\n"; kstrcpy(buf + pos, t); pos += kstrlen(t); }
+        { kstrcpy(buf + pos, question); pos += kstrlen(question); }
+        { const char *t = "<|im_end|>\n<|im_start|>assistant\n"; kstrcpy(buf + pos, t); pos += kstrlen(t); }
     } else if (kstrlen(m->arch) >= 5 &&
                m->arch[0] == 'g' && m->arch[1] == 'e' &&
                m->arch[2] == 'm' && m->arch[3] == 'm' && m->arch[4] == 'a') {
         /* Gemma format */
-        pos += kstrcpy(buf + pos, "<start_of_turn>user\n");
-        pos += kstrcpy(buf + pos, question);
-        pos += kstrcpy(buf + pos, "<end_of_turn>\n<start_of_turn>model\n");
+        { const char *t = "<start_of_turn>user\n"; kstrcpy(buf + pos, t); pos += kstrlen(t); }
+        { kstrcpy(buf + pos, question); pos += kstrlen(question); }
+        { const char *t = "<end_of_turn>\n<start_of_turn>model\n"; kstrcpy(buf + pos, t); pos += kstrlen(t); }
     } else {
         /* Generic: simple text prompt (works with any model) */
-        pos += kstrcpy(buf + pos, question);
+        { kstrcpy(buf + pos, question); pos += kstrlen(question); }
     }
     (void)max_len;
     return pos;

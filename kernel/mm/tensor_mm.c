@@ -632,6 +632,7 @@ void tensor_mm_get_stats(mm_stats_t *stats)
     stats->model_cache_used = model_cache.total_size;
 }
 
+#ifndef __aarch64__
 /* =============================================================================
  * Virtual Memory: 4K Page Mapping
  *
@@ -774,3 +775,4 @@ int vm_demand_fault(uint64_t fault_addr)
 
     return 0;
 }
+#endif /* !__aarch64__ */

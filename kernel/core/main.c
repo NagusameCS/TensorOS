@@ -359,6 +359,21 @@ write_fail:
     BREADCRUMB(3);  /* after vga_init */
     sdlog("BC=3 after vga_init (framebuffer + UART ok)");
 
+#if defined(__aarch64__)
+    /* Initialise HDMI framebuffer via VideoCore mailbox.
+     * Must happen BEFORE first kprintf so output appears on screen. */
+    {
+        extern int fb_init(void);
+        extern void fb_boot_splash(void);
+        int fb_rc = fb_init();
+        if (fb_rc == 0) {
+            fb_boot_splash();
+            /* fb_putchar is already hooked into serial_putchar */
+        }
+        /* If fb_init fails, we continue — UART console still works */
+    }
+#endif
+
     kprintf("TensorOS v%d.%d.%d \"%s\" booting...\n",
             TENSOROS_VERSION_MAJOR, TENSOROS_VERSION_MINOR,
             TENSOROS_VERSION_PATCH, TENSOROS_CODENAME);

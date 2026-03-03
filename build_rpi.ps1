@@ -70,6 +70,7 @@ $SOURCES = @(
     "userland\train\train_service.c",
     "kernel\drivers\bt\rpi_bt.c",
     "kernel\drivers\blk\rpi_sd.c",
+    "kernel\drivers\gpu\rpi_fb.c",
     "kernel\update\ota.c"
 )
 
