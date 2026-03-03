@@ -13,14 +13,11 @@
 
 #if defined(__aarch64__)
 /* ARM64: HDMI framebuffer console + UART serial output.
- * fb_init() requests a 1280x720 framebuffer from the VideoCore GPU
- * via the mailbox, then all text is rendered with an 8x8 bitmap font. */
+ * fb_init() is called from kernel_main AFTER the early diagnostics.
+ * vga_init() only sets up UART — fb_init is called separately. */
 void vga_init(void) {
     uart_init();
-    if (fb_init() == 0)
-        uart_puts("[FB] HDMI framebuffer 1280x720@32bpp ready\r\n");
-    else
-        uart_puts("[FB] HDMI init failed — serial only\r\n");
+    /* fb_init() called from kernel_main() — NOT here (was causing double-init) */
 }
 static void vga_putchar(char c) { fb_putchar(c); }
 static void vga_puts(const char *s) { fb_puts(s); }
@@ -36,6 +33,25 @@ static uint16_t *vga_buffer = (uint16_t *)VGA_ADDR;
 static int vga_col = 0;
 static int vga_row = 0;
 
+/* Update VGA hardware cursor to current position */
+static void vga_update_cursor(void)
+{
+    uint16_t pos = (uint16_t)(vga_row * VGA_WIDTH + vga_col);
+    outb(0x3D4, 0x0F);
+    outb(0x3D5, (uint8_t)(pos & 0xFF));
+    outb(0x3D4, 0x0E);
+    outb(0x3D5, (uint8_t)((pos >> 8) & 0xFF));
+}
+
+/* Enable the VGA text-mode blinking cursor (scanlines 13-15) */
+static void vga_enable_cursor(void)
+{
+    outb(0x3D4, 0x0A);
+    outb(0x3D5, (inb(0x3D5) & 0xC0) | 13);  /* Start scanline */
+    outb(0x3D4, 0x0B);
+    outb(0x3D5, (inb(0x3D5) & 0xE0) | 15);  /* End scanline */
+}
+
 void vga_init(void)
 {
     vga_buffer = (uint16_t *)VGA_ADDR;
@@ -44,6 +60,8 @@ void vga_init(void)
     /* Clear screen */
     for (int i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
         vga_buffer[i] = (VGA_ATTR << 8) | ' ';
+    vga_enable_cursor();
+    vga_update_cursor();
 }
 
 static void vga_scroll(void)
@@ -62,6 +80,11 @@ static void vga_putchar(char c)
         vga_row++;
     } else if (c == '\r') {
         vga_col = 0;
+    } else if (c == '\b' || c == 0x7F) {
+        if (vga_col > 0) {
+            vga_col--;
+            vga_buffer[vga_row * VGA_WIDTH + vga_col] = (VGA_ATTR << 8) | ' ';
+        }
     } else if (c == '\t') {
         vga_col = (vga_col + 8) & ~7;
     } else {
@@ -74,6 +97,7 @@ static void vga_putchar(char c)
     }
     if (vga_row >= VGA_HEIGHT)
         vga_scroll();
+    vga_update_cursor();
 }
 
 static void vga_puts(const char *s)

@@ -11,7 +11,7 @@
  *
  * This enables runtime dispatch: if AVX2+FMA are available, GEMM uses
  * 8-wide YMM registers with fused multiply-add for ~2x over SSE2.
- * =============================================================================*/*/
+ * =============================================================================*/
 
 #include "kernel/core/kernel.h"
 #include "kernel/core/cpu_features.h"

@@ -223,19 +223,26 @@ boot_delay=0
     Set-Content "$SDDrive\config.txt" $config -NoNewline
     Write-Host "  [OK] config.txt written" -ForegroundColor Green
 
-    # Ensure required firmware files exist
+    # Ensure required firmware files exist — auto-copy from firmware/ if available
     $firmware = @("bootcode.bin", "start4.elf", "fixup4.dat")
+    $fwDir = Join-Path $PSScriptRoot "firmware"
     $missing = @()
     foreach ($f in $firmware) {
         if (-not (Test-Path "$SDDrive\$f")) {
-            $missing += $f
+            $local = Join-Path $fwDir $f
+            if (Test-Path $local) {
+                Copy-Item $local "$SDDrive\$f" -Force
+                Write-Host "  [OK] $f copied from firmware/" -ForegroundColor Green
+            } else {
+                $missing += $f
+            }
+        } else {
+            Write-Host "  [OK] $f already on SD" -ForegroundColor Green
         }
     }
     if ($missing.Count -gt 0) {
         Write-Host "  WARNING: Missing firmware files: $($missing -join ', ')" -ForegroundColor Yellow
-        Write-Host "  The Pi needs these to boot. Copy from raspberrypi.org firmware repo." -ForegroundColor Yellow
-    } else {
-        Write-Host "  [OK] Firmware files present (bootcode.bin, start4.elf, fixup4.dat)" -ForegroundColor Green
+        Write-Host "  Run: Invoke-WebRequest https://github.com/raspberrypi/firmware/raw/master/boot/<file> -OutFile firmware\<file>" -ForegroundColor Yellow
     }
 
     Write-Host "`n=== SD card ready! Insert into RPi4 and power on. ===" -ForegroundColor Green

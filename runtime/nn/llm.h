@@ -32,9 +32,13 @@
 #define LLM_MAX_HEADS     32
 #define LLM_MAX_KV_HEADS  32
 #define LLM_MAX_VOCAB     160000
-#define LLM_MAX_SEQ       256
-#define LLM_MAX_TOKENS    512      /* Max tokens in prompt+generation */
-#define LLM_KV_FLOATS     (8 * 1024 * 1024)  /* 8M floats = 32MB per K/V */
+#define LLM_MAX_SEQ       2048
+#define LLM_MAX_TOKENS    4096     /* Max tokens in prompt+generation */
+#define LLM_KV_FLOATS     (12 * 1024 * 1024) /* 12M floats = 48MB per K/V */
+
+/* ─── Hash-table tokenizer ─── */
+#define LLM_HASH_BITS     17       /* 131072 slots */
+#define LLM_HASH_SIZE     (1 << LLM_HASH_BITS)
 
 /* ─── Layer Weights (pointers into GGUF data) ─── */
 typedef struct {
@@ -102,6 +106,9 @@ typedef struct {
     llm_vocab_entry_t *vocab;   /* [vocab_size] */
     float             *vocab_scores; /* [vocab_size] merge scores */
 
+    /* Hash table for O(1) token lookup by string */
+    int16_t           *vocab_ht_slot; /* [LLM_HASH_SIZE] → vocab index or -1 */
+
     /* Model data buffer */
     void    *data_buf;          /* Loaded GGUF file */
     uint64_t data_size;         /* Size of loaded data */
@@ -110,9 +117,39 @@ typedef struct {
 /* ─── API ─── */
 
 /**
- * Main entry point: detect disk, load model, run math evaluation.
- * Called from kernel boot sequence after virtio-blk init.
+ * Boot-time loader: detect disk, load model into RAM. Fast — no eval.
+ */
+void llm_boot_load(void);
+
+/**
+ * Full eval: load model + run benchmark + math eval (legacy, slow).
  */
 void llm_run_eval(void);
+
+/**
+ * Run benchmark + math eval on already-loaded model.
+ */
+void llm_run_full_eval(void);
+
+/**
+ * Interactive prompt: tokenize user text, generate response.
+ * Returns number of generated tokens, or -1 on error.
+ */
+int llm_prompt(const char *user_text, char *output, int max_output);
+
+/**
+ * Check if an LLM model is currently loaded.
+ */
+int llm_is_loaded(void);
+
+/**
+ * Return the name of the currently loaded model (or "(none)").
+ */
+const char *llm_model_name(void);
+
+/**
+ * Reset the KV cache (for starting a new conversation).
+ */
+void llm_reset_cache(void);
 
 #endif /* TENSOROS_LLM_H */

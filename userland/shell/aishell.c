@@ -3,8 +3,10 @@
  * =============================================================================*/
 
 #include "userland/shell/aishell.h"
+#include "kernel/core/perf.h"
 #include "kernel/mm/tensor_mm.h"
 #include "kernel/update/ota.h"
+#include "runtime/nn/llm.h"
 
 /* ---- Forward declarations ---- */
 static int  shell_exec_builtin(aishell_t *sh, int argc, char **argv);
@@ -72,7 +74,7 @@ static int shell_read_line(aishell_t *sh, char *buf, int max)
             kprintf("\n");
             return pos;
         }
-        if (c == '\b') {
+        if (c == '\b' || c == 0x7F) {
             if (pos > 0) {
                 pos--;
                 kprintf("\b \b");
@@ -331,26 +333,58 @@ static int cmd_bench(aishell_t *sh, int argc, char **argv)
 static int cmd_demo(aishell_t *sh, int argc, char **argv)
 {
     if (argc < 2) {
-        kprintf("Usage: demo <infer|quant|evolve|train|all>\n");
+        kprintf("Usage: demo <type>\n");
+        kprintf("  infer    Neural network inference demos\n");
+        kprintf("  quant    INT16 quantized inference\n");
+        kprintf("  evolve   Neuroevolution architecture search\n");
+        kprintf("  train    Backprop + Adam training\n");
+        kprintf("  sne      Speculative Neural Execution (5 techniques)\n");
+        kprintf("  transformer  KV-cache transformer engine\n");
+        kprintf("  q4       INT4 block quantization\n");
+        kprintf("  arena    Tensor memory arena\n");
+        kprintf("  mathllm  Micro math LLMs\n");
+        kprintf("  gguf     GGUF model parser demo\n");
+        kprintf("  llmeval  Full LLM benchmark + math eval\n");
+        kprintf("  all      Run everything\n");
         return 1;
     }
     extern void nn_run_demos(void);
     extern void nn_quant_demos(void);
     extern void nn_evolve_demos(void);
     extern void nn_train_demos(void);
+    extern void sne_run_demos(void);
+    extern void tf_run_demos(void);
+    extern void q4_run_demos(void);
+    extern void arena_run_demos(void);
+    extern void math_llm_run_eval(void);
+    extern void gguf_run_demos(void);
+    extern void llm_run_full_eval(void);
 
-    if (shell_strcmp(argv[1], "infer") == 0)  { nn_run_demos(); return 0; }
-    if (shell_strcmp(argv[1], "quant") == 0)  { nn_quant_demos(); return 0; }
-    if (shell_strcmp(argv[1], "evolve") == 0) { nn_evolve_demos(); return 0; }
-    if (shell_strcmp(argv[1], "train") == 0)  { nn_train_demos(); return 0; }
+    if (shell_strcmp(argv[1], "infer") == 0)       { nn_run_demos(); return 0; }
+    if (shell_strcmp(argv[1], "quant") == 0)        { nn_quant_demos(); return 0; }
+    if (shell_strcmp(argv[1], "evolve") == 0)       { nn_evolve_demos(); return 0; }
+    if (shell_strcmp(argv[1], "train") == 0)        { nn_train_demos(); return 0; }
+    if (shell_strcmp(argv[1], "sne") == 0)          { sne_run_demos(); return 0; }
+    if (shell_strcmp(argv[1], "transformer") == 0)  { tf_run_demos(); return 0; }
+    if (shell_strcmp(argv[1], "q4") == 0)           { q4_run_demos(); return 0; }
+    if (shell_strcmp(argv[1], "arena") == 0)        { arena_run_demos(); return 0; }
+    if (shell_strcmp(argv[1], "mathllm") == 0)      { math_llm_run_eval(); return 0; }
+    if (shell_strcmp(argv[1], "gguf") == 0)         { gguf_run_demos(); return 0; }
+    if (shell_strcmp(argv[1], "llmeval") == 0)      { llm_run_full_eval(); return 0; }
     if (shell_strcmp(argv[1], "all") == 0) {
         nn_run_demos();
         nn_quant_demos();
         nn_evolve_demos();
         nn_train_demos();
+        sne_run_demos();
+        tf_run_demos();
+        q4_run_demos();
+        arena_run_demos();
+        math_llm_run_eval();
+        gguf_run_demos();
         return 0;
     }
-    kprintf("Unknown demo: %s\n", argv[1]);
+    kprintf("Unknown demo: %s (type 'demo' for list)\n", argv[1]);
     return 1;
 }
 
@@ -406,7 +440,203 @@ static int cmd_clear(aishell_t *sh, int argc, char **argv)
 
 static int cmd_uname(aishell_t *sh, int argc, char **argv)
 {
+#if defined(__aarch64__)
+    kprintf("TensorOS v0.1.0 \"Neuron\" aarch64 NEON\n");
+#else
     kprintf("TensorOS v0.1.0 \"Neuron\" x86_64 SSE2\n");
+#endif
+    return 0;
+}
+
+/* ---- Interactive LLM prompt ---- */
+
+static int cmd_llm(aishell_t *sh, int argc, char **argv)
+{
+    if (!llm_is_loaded()) {
+        kprintf("[LLM] No model loaded. Attach a GGUF model disk to use this.\n");
+        return 1;
+    }
+
+    if (argc < 2) {
+        kprintf("[LLM] Model: %s\n", llm_model_name());
+        kprintf("Usage: llm <your prompt text>\n");
+        kprintf("  e.g. llm What is 2+2?\n");
+        kprintf("  e.g. llm Explain neural networks briefly\n");
+        return 0;
+    }
+
+    /* Concatenate all argv into one prompt string */
+    static char prompt[1024];
+    int pos = 0;
+    for (int i = 1; i < argc; i++) {
+        if (i > 1 && pos < 1020) prompt[pos++] = ' ';
+        for (const char *p = argv[i]; *p && pos < 1020; p++)
+            prompt[pos++] = *p;
+    }
+    prompt[pos] = '\0';
+
+    kprintf("[LLM] Model: %s\n", llm_model_name());
+    kprintf("[LLM] Prompt: %s\n", prompt);
+    kprintf("[LLM] Generating...\n");
+
+    static char response[2048];
+    uint64_t t0 = rdtsc_fenced();
+    int n_gen = llm_prompt(prompt, response, sizeof(response));
+    uint64_t t1 = rdtsc_fenced();
+    uint64_t ms = perf_cycles_to_us(t1 - t0) / 1000;
+
+    if (n_gen < 0) {
+        kprintf("[LLM] Error generating response.\n");
+        return 1;
+    }
+
+    kprintf("\n%s\n\n", response);
+    kprintf("[LLM] %d tokens in %lu ms", n_gen, ms);
+    if (n_gen > 0 && ms > 0) {
+        kprintf(" (%lu ms/tok)", ms / (uint64_t)n_gen);
+    }
+    kprintf("\n");
+    return 0;
+}
+
+/* ---- Reset LLM conversation ---- */
+
+static int cmd_reset(aishell_t *sh, int argc, char **argv)
+{
+    extern void llm_reset_cache(void);
+    llm_reset_cache();
+    kprintf("[LLM] Conversation reset. KV cache cleared.\n");
+    return 0;
+}
+
+/* ---- Memory info ---- */
+
+static int cmd_mem(aishell_t *sh, int argc, char **argv)
+{
+    extern uint64_t tensor_mm_free_bytes(void);
+    kprintf("\n=== Memory ===\n");
+    kprintf("  Total:     %lu MB\n", kstate.memory_total_bytes / (1024*1024));
+    kprintf("  Used:      %lu MB\n", kstate.memory_used_bytes / (1024*1024));
+    kprintf("  Free:      %lu MB\n", tensor_mm_free_bytes() / (1024*1024));
+    kprintf("  Tensor heap: 256 MB\n");
+    kprintf("  Model cache: 512 MB\n");
+    kprintf("\n");
+    return 0;
+}
+
+/* ---- Uptime ---- */
+
+static int cmd_uptime(aishell_t *sh, int argc, char **argv)
+{
+    extern uint64_t watchdog_uptime_ms(void);
+    uint64_t ms = watchdog_uptime_ms();
+    uint64_t sec = ms / 1000;
+    uint64_t min = sec / 60;
+    uint64_t hr  = min / 60;
+    kprintf("up %lu:%02lu:%02lu (%lu ms)\n", hr, min % 60, sec % 60, ms);
+    return 0;
+}
+
+/* ---- Reboot ---- */
+
+static int cmd_reboot(aishell_t *sh, int argc, char **argv)
+{
+    kprintf("[REBOOT] Resetting system...\n");
+#ifndef __aarch64__
+    /* Triple-fault: load invalid IDT and trigger interrupt */
+    __asm__ volatile ("cli");
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) null_idtr = {0, 0};
+    __asm__ volatile ("lidt %0" : : "m"(null_idtr));
+    __asm__ volatile ("int $0x03");
+#else
+    /* ARM64: use PSCI SYSTEM_RESET */
+    __asm__ volatile ("mov x0, #0x84000009; hvc #0");
+#endif
+    /* Should not reach here */
+    while(1) __asm__ volatile ("hlt");
+    return 0;
+}
+
+/* ---- Process / MEU list ---- */
+
+static int cmd_ps(aishell_t *sh, int argc, char **argv)
+{
+    kprintf("\n  PID  STATE      TYPE       NAME\n");
+    kprintf("  ---  ---------  ---------  --------------------\n");
+    kprintf("  0    RUNNING    kernel     TensorOS kernel\n");
+    kprintf("  1    RUNNING    shell      aishell\n");
+    for (uint32_t i = 0; i < kstate.meu_count; i++) {
+        model_exec_unit_t *meu = &kstate.meus[i];
+        kprintf("  %3u  %-9s  model      %s\n",
+                i + 2,
+                meu->state == MEU_STATE_RUNNING ? "RUNNING" :
+                meu->state == MEU_STATE_READY   ? "READY"   :
+                meu->state == MEU_STATE_LOADING ? "LOADING" : "STOPPED",
+                meu->name);
+    }
+    if (llm_is_loaded()) {
+        kprintf("  %3u  RUNNING    llm        %s\n", kstate.meu_count + 2, llm_model_name());
+    }
+    kprintf("\n");
+    return 0;
+}
+
+/* ---- Echo ---- */
+
+static int cmd_echo(aishell_t *sh, int argc, char **argv)
+{
+    for (int i = 1; i < argc; i++) {
+        if (i > 1) kprintf(" ");
+        kprintf("%s", argv[i]);
+    }
+    kprintf("\n");
+    return 0;
+}
+
+/* ---- lspci ---- */
+
+static int cmd_lspci(aishell_t *sh, int argc, char **argv)
+{
+    kprintf("\n=== PCI Devices ===\n");
+    extern void pci_enumerate(void);
+    pci_enumerate();
+    kprintf("\n");
+    return 0;
+}
+
+/* ---- sysinfo (comprehensive) ---- */
+
+static int cmd_sysinfo(aishell_t *sh, int argc, char **argv)
+{
+    extern uint64_t perf_tsc_mhz(void);
+    extern uint64_t tensor_mm_free_bytes(void);
+    extern uint64_t watchdog_uptime_ms(void);
+
+    uint64_t ms  = watchdog_uptime_ms();
+    uint64_t sec = ms / 1000;
+
+    kprintf("\n=== TensorOS System Information ===\n\n");
+#if defined(__aarch64__)
+    kprintf("  OS:         TensorOS v0.1.0 \"Neuron\" (aarch64)\n");
+    kprintf("  SIMD:       NEON 128-bit\n");
+#else
+    kprintf("  OS:         TensorOS v0.1.0 \"Neuron\" (x86_64)\n");
+    kprintf("  SIMD:       SSE2 128-bit\n");
+#endif
+    kprintf("  CPUs:       %d\n", kstate.cpu_count);
+    kprintf("  GPUs:       %d\n", kstate.gpu_count);
+    kprintf("  TSC:        %lu MHz\n", perf_tsc_mhz());
+    kprintf("  RAM:        %lu MB total, %lu MB free\n",
+            kstate.memory_total_bytes / (1024*1024),
+            tensor_mm_free_bytes() / (1024*1024));
+    kprintf("  Uptime:     %lu s\n", sec);
+    kprintf("  MEUs:       %d loaded\n", kstate.meu_count);
+    kprintf("  Tensor ops: %lu\n", kstate.tensor_ops_total);
+    if (llm_is_loaded())
+        kprintf("  LLM:        %s (loaded)\n", llm_model_name());
+    else
+        kprintf("  LLM:        (none)\n");
+    kprintf("\n");
     return 0;
 }
 
@@ -415,30 +645,38 @@ static void shell_print_help(void)
     kprintf("\n");
     kprintf("TensorOS AI Shell - Built-in Commands\n");
     kprintf("======================================\n");
+    kprintf("  --- General ---\n");
+    kprintf("  help                      This message\n");
     kprintf("  status                    System status overview\n");
-    kprintf("  bench                     Run performance benchmarks\n");
-    kprintf("  demo <type>               Run AI demos (infer|quant|evolve|train|all)\n");
-    kprintf("  model load <name>         Load model into MEU\n");
-    kprintf("  model list                List running MEUs\n");
-    kprintf("  model info <id>           Show MEU statistics\n");
-    kprintf("  model kill <id>           Terminate MEU\n");
-    kprintf("  tensor shape <expr>       Print tensor shape\n");
-    kprintf("  tensor cast <id> <dtype>  Requantize tensor\n");
+    kprintf("  sysinfo                   Comprehensive system info\n");
+    kprintf("  mem                       Memory usage\n");
+    kprintf("  uptime                    System uptime\n");
+    kprintf("  ps                        List processes / MEUs\n");
+    kprintf("  lspci                     List PCI devices\n");
+    kprintf("  uname                     Show OS version\n");
+    kprintf("  echo <text>               Print text\n");
+    kprintf("  clear                     Clear screen\n");
+    kprintf("  reboot                    Restart system\n");
+    kprintf("  exit                      Shutdown\n");
+    kprintf("\n  --- AI / LLM ---\n");
+    kprintf("  llm <prompt>              Chat with the loaded LLM\n");
+    kprintf("  reset                     Reset LLM conversation context\n");
     kprintf("  infer <model> <input>     Run inference\n");
     kprintf("  train <model> <dataset>   Launch training\n");
     kprintf("  deploy <model> [port]     Deploy as service\n");
-    kprintf("  git <subcommand>          Kernel-level git\n");
-    kprintf("  pkg install <model>       Install from registry\n");
-    kprintf("  pkg search <query>        Search registries\n");
+    kprintf("  model list|load|info|kill  Manage model exec units\n");
+    kprintf("  tensor shape|cast|info    Tensor operations\n");
+    kprintf("\n  --- Benchmarks & Demos ---\n");
+    kprintf("  bench                     Run GEMM/SIMD benchmarks\n");
+    kprintf("  demo <type>               AI demos (type 'demo' for list)\n");
+    kprintf("\n  --- Subsystems ---\n");
     kprintf("  monitor                   System monitor\n");
+    kprintf("  git <subcommand>          Kernel-level git\n");
+    kprintf("  pkg install|search|list   Model package manager\n");
     kprintf("  sandbox <policy> <cmd>    Run in sandbox\n");
     kprintf("  run <script.pseudo>       Execute Pseudocode\n");
     kprintf("  ota                       OTA update (RAM chain-load)\n");
     kprintf("  flash                     OTA update (persistent SD write)\n");
-    kprintf("  clear                     Clear screen\n");
-    kprintf("  uname                     Show OS version\n");
-    kprintf("  help                      This message\n");
-    kprintf("  exit                      Shutdown\n");
     kprintf("\n");
     kprintf("Any other input is treated as Pseudocode and JIT-compiled.\n\n");
 }
@@ -447,7 +685,16 @@ static int shell_exec_builtin(aishell_t *sh, int argc, char **argv)
 {
     if (argc == 0) return 0;
 
+    if (shell_strcmp(argv[0], "help")    == 0) { shell_print_help(); return 0; }
     if (shell_strcmp(argv[0], "status")  == 0) return cmd_status(sh, argc, argv);
+    if (shell_strcmp(argv[0], "sysinfo") == 0) return cmd_sysinfo(sh, argc, argv);
+    if (shell_strcmp(argv[0], "mem")     == 0) return cmd_mem(sh, argc, argv);
+    if (shell_strcmp(argv[0], "uptime")  == 0) return cmd_uptime(sh, argc, argv);
+    if (shell_strcmp(argv[0], "ps")      == 0) return cmd_ps(sh, argc, argv);
+    if (shell_strcmp(argv[0], "lspci")   == 0) return cmd_lspci(sh, argc, argv);
+    if (shell_strcmp(argv[0], "echo")    == 0) return cmd_echo(sh, argc, argv);
+    if (shell_strcmp(argv[0], "reboot")  == 0) return cmd_reboot(sh, argc, argv);
+    if (shell_strcmp(argv[0], "llm")     == 0) return cmd_llm(sh, argc, argv);
     if (shell_strcmp(argv[0], "bench")   == 0) return cmd_bench(sh, argc, argv);
     if (shell_strcmp(argv[0], "demo")    == 0) return cmd_demo(sh, argc, argv);
     if (shell_strcmp(argv[0], "model")   == 0) return cmd_model(sh, argc, argv);
@@ -463,8 +710,8 @@ static int shell_exec_builtin(aishell_t *sh, int argc, char **argv)
     if (shell_strcmp(argv[0], "ota")     == 0) return cmd_ota(sh, argc, argv);
     if (shell_strcmp(argv[0], "flash")   == 0) return cmd_flash(sh, argc, argv);
     if (shell_strcmp(argv[0], "clear")   == 0) return cmd_clear(sh, argc, argv);
+    if (shell_strcmp(argv[0], "reset")   == 0) return cmd_reset(sh, argc, argv);
     if (shell_strcmp(argv[0], "uname")   == 0) return cmd_uname(sh, argc, argv);
-    if (shell_strcmp(argv[0], "help")    == 0) { shell_print_help(); return 0; }
 
     return -1; /* Not a builtin */
 }
@@ -481,7 +728,12 @@ static void shell_print_banner(void)
     kprintf("/_/  \\___/_/ /_/____/\\____/_/  \\____//____/  \n");
     kprintf("\n");
     kprintf("TensorOS v0.1.0 - AI-First Operating System\n");
-    kprintf("Type 'help' for commands, or type Pseudocode directly.\n\n");
+    kprintf("%d CPU(s), %lu MB RAM", kstate.cpu_count,
+            kstate.memory_total_bytes / (1024*1024));
+    if (llm_is_loaded())
+        kprintf(", LLM: %s", llm_model_name());
+    kprintf("\n");
+    kprintf("Type 'help' for commands, 'llm <prompt>' to chat with AI.\n\n");
 }
 
 /* ---- Main Shell Entry ---- */

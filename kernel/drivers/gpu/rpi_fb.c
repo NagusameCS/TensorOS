@@ -257,18 +257,25 @@ int fb_init(void)
     /* Fill total size */
     mbox_buf[0] = idx * 4;
 
-    /* Data + instruction barriers before mailbox write */
-    __asm__ volatile ("dsb sy" ::: "memory");
+    /* Flush CPU cache to SDRAM so the GPU sees our mailbox data.
+     * The VideoCore reads from SDRAM, not the ARM L1/L2 cache. */
+    uint32_t buf_size = idx * 4;
+    arm_cache_clean_invalidate(mbox_buf, buf_size);
 
     /* Send the buffer address to mailbox channel 8.
      * The VC expects a BUS address.  On the BCM2711 the ARM→VC mapping
-     * for the first 1 GB is: bus_addr = phys_addr | 0xC0000000. */
+     * for the first 1 GB is: bus_addr = phys_addr | 0xC0000000.
+     * The 0xC0000000 alias bypasses the VC's L2 cache for coherency. */
     uint32_t buf_phys = (uint32_t)(uintptr_t)mbox_buf;
-    mbox_write(MBOX_CH_PROP, buf_phys);
+    uint32_t bus_addr = buf_phys | 0xC0000000;
+    mbox_write(MBOX_CH_PROP, bus_addr);
 
     /* Read response */
     (void)mbox_read(MBOX_CH_PROP);
-    __asm__ volatile ("dsb sy" ::: "memory");
+
+    /* Invalidate cache so we read the GPU's response from SDRAM,
+     * not stale cached data. */
+    arm_cache_clean_invalidate(mbox_buf, buf_size);
 
     /* Check response */
     if (mbox_buf[1] != MBOX_RESPONSE) {

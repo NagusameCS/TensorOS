@@ -148,230 +148,82 @@ void kernel_main(void)
 
 #if defined(__aarch64__)
     /* ================================================================
-     * STAGE-GATE DIAGNOSTIC
+     * ARM64 FIRST-BOOT CONFIGURATION
      *
-     * Change DIAG_STAGE to test one thing at a time:
-     *   0 = diagnostics OFF, normal boot
-     *   1 = halt here: LED ON = C code reached
-     *   2 = halt after: mbox power-on SD card device
-     *   3 = halt after: mbox set EMMC2 clock
-     *   4 = halt after: sd_init() (the full SD card init)
-     *   5 = halt after: sdlog_init() (SD + FAT32 + find BOOTLOG.TXT)
-     *   6 = halt after: sdlog_flush() (actually wrote to SD card)
-     *   7 = halt after: vga_init (framebuffer + UART)
-     *
-     * LED ON  = that stage PASSED
-     * LED OFF = it never got there (crashed or hung before)
+     * Set ARM64_SKIP_SD_INIT=1 to skip SD card init and go straight
+     * to HDMI framebuffer.  Use this for initial hardware bring-up.
+     * Set to 0 once HDMI is working to enable SD boot logging.
      * ================================================================ */
-    #define DIAG_STAGE 0
+    #define ARM64_SKIP_SD_INIT 1
 
-    /* Helper: turn LED OFF and halt forever (OFF = success/passed) */
-    #define DIAG_PASS() do { \
-        led_off(); \
-        while (1) __asm__ volatile("wfi"); \
-    } while (0)
+    /* ================================================================
+     * LED milestones — visible without UART adapter.
+     * Each milestone: N quick blinks (125ms on/off), 500ms gap.
+     *   1 blink  = C code reached
+     *   2 blinks = before framebuffer init
+     *   3 blinks = framebuffer init done
+     *   4 blinks = entering main boot phases
+     * ================================================================ */
+    led_blink(1);  /* MILESTONE 1: C code alive */
+    uart_puts("[LED] M1: C code entry\r\n");
 
-    #if DIAG_STAGE == 1
-        /* Stage 1: Did we reach C code at all? */
-        DIAG_PASS();
-    #endif
+    int sdlog_rc = -1;  /* No SD logging until we enable it */
 
-    /* Stage 2: Mailbox power-on SD device */
+#if !ARM64_SKIP_SD_INIT
+    /* SD card init — skip this for initial HDMI bring-up */
     {
         volatile uint32_t __attribute__((aligned(16))) mb[8];
-        mb[0] = 8 * 4;
-        mb[1] = 0;
-        mb[2] = 0x00028001;  /* SET_POWER_STATE */
-        mb[3] = 8;
-        mb[4] = 8;
-        mb[5] = 0x00000000;  /* device: SD card */
-        mb[6] = 0x03;        /* state: on | wait */
-        mb[7] = 0;
-        int mbox_ok = mbox_call(8, mb);
-        (void)mbox_ok;
+        mb[0] = 8 * 4; mb[1] = 0;
+        mb[2] = 0x00028001; mb[3] = 8; mb[4] = 8;
+        mb[5] = 0; mb[6] = 0x03; mb[7] = 0;
+        mbox_call(8, mb);
     }
-    #if DIAG_STAGE == 2
-        DIAG_PASS();  /* LED ON = mailbox power-on succeeded (didn't hang) */
-    #endif
-
-    /* Stage 3: Set EMMC2 clock to 200 MHz */
     {
         volatile uint32_t __attribute__((aligned(16))) mb[9];
-        mb[0] = 9 * 4;
-        mb[1] = 0;
-        mb[2] = 0x00038002;  /* SET_CLOCK_RATE */
-        mb[3] = 12;
-        mb[4] = 12;
-        mb[5] = 0x0000000C;  /* EMMC2 clock */
-        mb[6] = 200000000;   /* 200 MHz */
-        mb[7] = 0;
-        mb[8] = 0;
-        int mbox_ok = mbox_call(8, mb);
-        (void)mbox_ok;
+        mb[0] = 9 * 4; mb[1] = 0;
+        mb[2] = 0x00038002; mb[3] = 12; mb[4] = 12;
+        mb[5] = 0x0000000C; mb[6] = 200000000; mb[7] = 0; mb[8] = 0;
+        mbox_call(8, mb);
     }
-    #if DIAG_STAGE == 3
-        DIAG_PASS();
-    #endif
+    sd_init();
+    sdlog_rc = sdlog_init();
+    uart_puts("[SDLOG] SD init done\r\n");
+#endif /* !ARM64_SKIP_SD_INIT */
 
-    /* Stage 4: Full sd_init() */
-    {
-        int sd_rc = sd_init();
-        (void)sd_rc;
-    }
-    #if DIAG_STAGE == 4
-        DIAG_PASS();
-    #endif
-
-    /* Stage 5: Full sdlog_init() (SD + FAT32 + BOOTLOG.TXT) */
-    int sdlog_rc;
-    {
-        /* sd_init already called above, so reset state and re-init.
-         * Actually sdlog_init calls sd_init itself, so the double-init
-         * is safe — sd_init checks sd_initialized. */
-        sdlog_rc = sdlog_init();
-    }
-    #if DIAG_STAGE == 5
-        if (sdlog_rc == 0) DIAG_PASS();
-        /* If we get here, sdlog_init failed — LED stays off */
-        while (1) __asm__ volatile("wfi");
-    #endif
-
-    /* Stage 6: ULTIMATE write test — write to SECTOR 1 (fixed, no calculation).
-     * Sector 1 is the unused gap after MBR, before partition at sector 2048.
-     * User checks it with: dd/hex dump of sector 1 on the laptop. */
-    #if DIAG_STAGE == 6
-    {
-        extern uint32_t sd_rca;
-        uint8_t test_buf[512] __attribute__((aligned(16)));
-        /* Fill with recognizable pattern */
-        for (int i = 0; i < 512; i++)
-            test_buf[i] = "TENSOR_OK!\n"[i % 11];
-
-        /* DIRECT MMIO write — no function calls, maximum control */
-        volatile uint32_t *emmc = (volatile uint32_t *)0xFE340000;
-        uint32_t addr = 1; /* Sector 1 (SDHC uses block addressing) */
-
-        /* Set block size and count */
-        emmc[0x04/4] = (1 << 16) | 512;
-
-        /* Clear all interrupts */
-        emmc[0x30/4] = 0xFFFF003F;
-
-        /* Wait for CMD and DAT lines free */
-        while (emmc[0x24/4] & 0x03) { __asm__ volatile("nop"); }
-
-        /* Send CMD24 (WRITE_BLOCK): index=24, R1 response, data, write direction */
-        emmc[0x08/4] = addr;                /* ARG1 */
-        emmc[0x0C/4] = 0x182A0000;          /* CMDTM: CMD24 + R1 + data + write */
-
-        /* Wait for CMD_DONE */
-        while (!(emmc[0x30/4] & 0x01)) {
-            if (emmc[0x30/4] & 0x8000) goto write_fail;
-        }
-        emmc[0x30/4] = 0x01;  /* Clear CMD_DONE */
-
-        /* Check R1 response for errors */
-        uint32_t resp = emmc[0x10/4];  /* RESP0 */
-        uart_puts("[WR] R1=");
-        {
-            char hex[9];
-            for (int i = 7; i >= 0; i--) {
-                int d = (resp >> (i*4)) & 0xF;
-                hex[7-i] = d < 10 ? '0'+d : 'A'+d-10;
-            }
-            hex[8] = 0;
-            uart_puts(hex);
-        }
-        uart_puts("\r\n");
-
-        /* Wait for WRITE_RDY */
-        while (!(emmc[0x30/4] & 0x10)) {
-            if (emmc[0x30/4] & 0x8000) goto write_fail;
-        }
-        emmc[0x30/4] = 0x10;  /* Clear WRITE_RDY */
-
-        /* Push 128 words (512 bytes) to DATA register */
-        __asm__ volatile("dsb sy" ::: "memory");
-        const uint32_t *words = (const uint32_t *)test_buf;
-        for (int i = 0; i < 128; i++) {
-            emmc[0x20/4] = words[i];
-        }
-        __asm__ volatile("dsb sy" ::: "memory");
-
-        /* Wait for DATA_DONE */
-        while (!(emmc[0x30/4] & 0x02)) {
-            if (emmc[0x30/4] & 0x8000) goto write_fail;
-        }
-        emmc[0x30/4] = 0x02;  /* Clear DATA_DONE */
-
-        /* Poll CMD13 until card exits programming state */
-        for (int i = 0; i < 1000; i++) {
-            /* Small delay */
-            for (volatile int d = 0; d < 50000; d++) __asm__ volatile("nop");
-
-            /* Wait for CMD line free */
-            while (emmc[0x24/4] & 0x01) { __asm__ volatile("nop"); }
-            emmc[0x30/4] = 0xFFFF003F;
-            emmc[0x08/4] = sd_rca << 16;
-            emmc[0x0C/4] = 0x0D020000;  /* CMD13: SEND_STATUS, R1 */
-
-            while (!(emmc[0x30/4] & 0x01)) {
-                if (emmc[0x30/4] & 0x8000) break;
-            }
-            emmc[0x30/4] = 0x01;
-
-            uint32_t status = emmc[0x10/4];
-            uint32_t state = (status >> 9) & 0xF;
-            if (state == 4) {
-                /* Card is in transfer state — programming complete */
-                uart_puts("[WR] DONE state=tran\r\n");
-                DIAG_PASS();
-            }
-        }
-        uart_puts("[WR] timeout waiting for tran\r\n");
-
-write_fail:
-        uart_puts("[WR] FAIL\r\n");
-        /* LED stays ON = write failed */
-        while (1) __asm__ volatile("wfi");
-    }
-    #endif
-
-    /* Report to UART (always) */
-    uart_puts("[SDLOG] rc=");
-    {
-        char b[12]; int v = sdlog_rc, n = 0;
-        if (v < 0) { uart_putchar('-'); v = -v; }
-        if (v == 0) b[n++] = '0';
-        else while (v > 0) { b[n++] = '0' + (v % 10); v /= 10; }
-        for (int i = n - 1; i >= 0; i--) uart_putchar(b[i]);
-    }
-    uart_puts("\r\n");
-
-#else
+#else /* !__aarch64__ (x86) */
     int sdlog_rc = -99;
-#endif
+#endif /* __aarch64__ */
 
+    /* ---- Common path: HDMI framebuffer + banner ---- */
     BREADCRUMB(2);  /* before vga_init */
+#if defined(__aarch64__)
+    led_blink(2);  /* MILESTONE 2: about to init framebuffer */
+    uart_puts("[LED] M2: before fb_init\r\n");
+#endif
     sdlog("BC=2 before vga_init");
     sdlog_flush();
     vga_init();
     BREADCRUMB(3);  /* after vga_init */
-    sdlog("BC=3 after vga_init (framebuffer + UART ok)");
+    sdlog("BC=3 after vga_init");
 
 #if defined(__aarch64__)
-    /* Initialise HDMI framebuffer via VideoCore mailbox.
-     * Must happen BEFORE first kprintf so output appears on screen. */
+    /* Initialise HDMI framebuffer via VideoCore mailbox */
     {
         extern int fb_init(void);
         extern void fb_boot_splash(void);
+        uart_puts("[FB] Calling fb_init...\r\n");
         int fb_rc = fb_init();
         if (fb_rc == 0) {
+            uart_puts("[FB] OK! Framebuffer ready\r\n");
             fb_boot_splash();
-            /* fb_putchar is already hooked into serial_putchar */
+        } else {
+            uart_puts("[FB] FAILED (rc=");
+            uart_putchar('0' + ((-fb_rc) % 10));
+            uart_puts(")\r\n");
         }
-        /* If fb_init fails, we continue — UART console still works */
     }
+    led_blink(3);  /* MILESTONE 3: framebuffer init done */
+    uart_puts("[LED] M3: fb_init done\r\n");
 #endif
 
     kprintf("TensorOS v%d.%d.%d \"%s\" booting...\n",
@@ -444,185 +296,65 @@ write_fail:
         kprintf("  [--] BT not available (no firmware?)\n");
 #endif
 
-    /* Phase 5: Performance Benchmarks */
-    sdlog("Phase5: benchmarks");
-    run_benchmarks();
-    sdlog("Phase5: benchmarks OK");
-
-    /* Phase 6: Neural Network Inference Demo */
-    sdlog("Phase6: NN inference");
-    nn_run_demos();
-
-    /* Phase 7: INT16 Quantized Inference */
-    sdlog("Phase7: INT16 quant");
-    nn_quant_demos();
-
-    /* Phase 8: Neuroevolution - Architecture Search */
-    sdlog("Phase8: neuroevolution");
-    nn_evolve_demos();
-
-    /* Phase 9: Backpropagation Training - Learn During Boot */
-    sdlog("Phase9: backprop");
-    nn_train_demos();
-
-    /* Phase 10: Speculative Neural Execution — 5 Revolutionary Techniques */
-    sdlog("Phase10: SNE");
-    sne_run_demos();
-    /* Phase 11: Transformer Engine with KV-Cache */
-    sdlog("Phase11: transformer");
-    tf_run_demos();
-    /* Phase 12: INT4 Block Quantization (GGML/llama.cpp-class) */
-    sdlog("Phase12: INT4 quant");
-    q4_run_demos();
-    /* Phase 13: Tensor Memory Arena */
-    sdlog("Phase13: arena");
-    sdlog_flush();
-    arena_run_demos();
-
-    /* Phase 13b: Math LLM Evaluation Suite */
-    sdlog("Phase13b: math LLM eval");
-    math_llm_run_eval();
-
-    /* Phase 14: CPU Feature Detection & AVX2 Enable */
-    sdlog("Phase14: CPU detect");
-    kprintf("\n[PHASE 14] CPU Feature Detection\n");
+    /* Phase 5: CPU Feature Detection & AVX2 Enable */
+    sdlog("Phase5: CPU detect");
+    kprintf("\n[PHASE 5] CPU Feature Detection\n");
 #if defined(__aarch64__)
     {
         uint64_t midr;
         __asm__ volatile ("mrs %0, midr_el1" : "=r"(midr));
-        kprintf("[CPU] ARM64 MIDR: %lx\n", midr);
-        kprintf("[CPU] ISA: NEON FP\n");
-        kprintf("[CPU] GEMM dispatch: NEON 4-wide (128-bit)\n");
+        kprintf("  [OK] ARM64 MIDR: %lx  ISA: NEON FP\n", midr);
     }
-
-    kprintf("\n[PHASE 15] ARM64 NEON GEMM active\n");
 #else
     cpu_detect_features();
     if (cpu_features.has_xsave && cpu_features.has_avx) {
         cpu_enable_avx();
     }
     cpu_print_features();
-
-    /* Phase 15: AVX2+FMA GEMM Benchmark (if available) */
-    if (cpu_features.avx2_usable) {
-        kprintf("\n[PHASE 15] AVX2+FMA GEMM Benchmark\n");
-        avx2_gemm_benchmark();
-    } else {
-        kprintf("\n[PHASE 15] AVX2 not available -- using SSE2 GEMM\n");
-    }
 #endif
 
-    /* Phase 16: Production Self-Test Suite */
-    sdlog("Phase16: self-test");
-    kprintf("\n[PHASE 16] Production Self-Test Suite\n");
+    /* Phase 6: Production Self-Test Suite */
+    sdlog("Phase6: self-test");
+    kprintf("\n[PHASE 6] Production Self-Test Suite\n");
     selftest_run_all();
 
-    /* Phase 17: GGUF Model Format Parser */
-    sdlog("Phase17: GGUF parser");
-    kprintf("\n[PHASE 17] GGUF Model Format Parser\n");
-    gguf_run_demos();
-
-    /* Phase 18: SMP Multi-Core Bootstrap */
-    sdlog("Phase18: SMP");
+    /* Phase 7: SMP Multi-Core Bootstrap */
+    sdlog("Phase7: SMP");
     sdlog_flush();
-    kprintf("\n[PHASE 18] SMP Multi-Core Bootstrap\n");
+    kprintf("\n[PHASE 7] SMP Multi-Core Bootstrap\n");
 #ifndef __aarch64__
     smp_run_demos();
     kstate.cpu_count = smp.cpu_count;  /* Update with actual SMP count */
 
-    /* --- SMP Work Dispatch Test --- */
+    /* Quick SMP dispatch test (no long benchmark) */
     if (smp.ap_started > 0) {
-        kprintf("\n  --- SMP Work Dispatch Test ---\n");
-
-        /* Simple smoke test: dispatch to each AP and verify completion */
         extern void smp_test_worker(void *arg);
         volatile uint32_t smp_test_flag = 0;
+        int smp_ok = 0, smp_fail = 0;
         for (uint32_t ap = 1; ap <= smp.ap_started; ap++) {
-            kprintf("  Dispatching to CPU %u...\n", ap);
             smp_test_flag = 0;
             __asm__ volatile ("mfence" ::: "memory");
             int rc = smp_dispatch(ap, smp_test_worker, (void *)&smp_test_flag);
-            if (rc != 0) {
-                kprintf("  CPU %u dispatch FAILED (rc=%d)\n", ap, rc);
-                continue;
-            }
-            /* Wait with timeout (500ms = 500000 iterations of pause) */
+            if (rc != 0) { smp_fail++; continue; }
             volatile int wait_ok = 0;
             for (uint64_t tries = 0; tries < 500000; tries++) {
                 if (smp.cpus[ap].work_done) { wait_ok = 1; break; }
                 __asm__ volatile ("pause");
             }
-            smp.cpus[ap].state = CPU_STATE_IDLE; /* Reset state regardless */
-            if (wait_ok && smp_test_flag == 0xCAFE)
-                kprintf("  CPU %u dispatch: PASS\n", ap);
-            else if (wait_ok)
-                kprintf("  CPU %u dispatch: WRONG (got 0x%x)\n", ap, smp_test_flag);
-            else
-                kprintf("  CPU %u dispatch: TIMEOUT\n", ap);
+            smp.cpus[ap].state = CPU_STATE_IDLE;
+            if (wait_ok && smp_test_flag == 0xCAFE) smp_ok++;
+            else smp_fail++;
         }
-
-        /* --- SMP Parallel GEMM Benchmark --- */
-        kprintf("\n  --- SMP Parallel GEMM Benchmark ---\n");
-        {
-            #define SMP_BENCH_N 128
-            static float smp_A[SMP_BENCH_N * SMP_BENCH_N];
-            static float smp_B[SMP_BENCH_N * SMP_BENCH_N];
-            static float smp_C1[SMP_BENCH_N * SMP_BENCH_N];
-            static float smp_C2[SMP_BENCH_N * SMP_BENCH_N];
-
-            /* Initialize matrices */
-            for (int i = 0; i < SMP_BENCH_N * SMP_BENCH_N; i++) {
-                smp_A[i] = (float)(i % 17) * 0.1f;
-                smp_B[i] = (float)(i % 13) * 0.1f;
-            }
-
-            /* Single-core benchmark */
-            uint64_t t0 = rdtsc_fenced();
-            for (int rep = 0; rep < 5; rep++)
-                tensor_cpu_matmul(smp_C1, smp_A, smp_B, SMP_BENCH_N, SMP_BENCH_N, SMP_BENCH_N);
-            uint64_t t1 = rdtsc_fenced();
-            uint64_t single_us = perf_cycles_to_us(t1 - t0) / 5;
-            uint64_t single_flops = (uint64_t)2 * SMP_BENCH_N * SMP_BENCH_N * SMP_BENCH_N;
-            uint64_t single_mflops = single_us > 0 ? single_flops / single_us : 0;
-            kprintf("  Single-core %dx%d: %lu MFLOPS (%lu us)\n",
-                    SMP_BENCH_N, SMP_BENCH_N, single_mflops, single_us);
-
-            /* Multi-core benchmark */
-            t0 = rdtsc_fenced();
-            for (int rep = 0; rep < 5; rep++)
-                tensor_cpu_matmul_smp(smp_C2, smp_A, smp_B, SMP_BENCH_N, SMP_BENCH_N, SMP_BENCH_N);
-            t1 = rdtsc_fenced();
-            uint64_t multi_us = perf_cycles_to_us(t1 - t0) / 5;
-            uint64_t multi_mflops = multi_us > 0 ? single_flops / multi_us : 0;
-            kprintf("  SMP %u-core  %dx%d: %lu MFLOPS (%lu us)\n",
-                    smp.ap_started + 1, SMP_BENCH_N, SMP_BENCH_N, multi_mflops, multi_us);
-
-            /* Correctness check: compare single vs multi-core output */
-            int errors = 0;
-            for (int i = 0; i < SMP_BENCH_N * SMP_BENCH_N; i++) {
-                float diff = smp_C1[i] - smp_C2[i];
-                if (diff > 0.01f || diff < -0.01f) errors++;
-            }
-            if (errors == 0)
-                kprintf("  Correctness: PASS (single==multi)\n");
-            else
-                kprintf("  Correctness: FAIL (%d mismatches)\n", errors);
-
-            if (single_us > 0 && multi_us > 0) {
-                uint64_t speedup_x10 = (single_us * 10) / multi_us;
-                kprintf("  Speedup: %lu.%lux (%u cores)\n",
-                        speedup_x10 / 10, speedup_x10 % 10, smp.ap_started + 1);
-            }
-            #undef SMP_BENCH_N
-        }
+        kprintf("  [OK] SMP dispatch: %d/%d cores responding\n",
+                smp_ok, smp.ap_started);
     }
 #else
     kprintf("  [OK] ARM64 PSCI multicore (4 Cortex-A72 cores)\n");
 #endif
 
-    /* Phase 19: Virtio Block Device */
-    sdlog("Phase19: storage");
-    kprintf("\n[PHASE 19] Storage Driver\n");
+    /* Phase 8: Storage Driver */
+    sdlog("Phase8: storage");
+    kprintf("\n[PHASE 8] Storage Driver\n");
 #ifndef __aarch64__
     {
         int blk_rc = virtio_blk_init();
@@ -636,9 +368,9 @@ write_fail:
     kprintf("  [OK] SD/eMMC via EMMC2 (BCM2711)\n");
 #endif
 
-    /* Phase 20: Virtio Network + IP Stack */
-    sdlog("Phase20: network");
-    kprintf("\n[PHASE 20] Network Stack\n");
+    /* Phase 9: Network Stack */
+    sdlog("Phase9: network");
+    kprintf("\n[PHASE 9] Network Stack\n");
 #ifndef __aarch64__
     {
         int net_rc = virtio_net_init();
@@ -657,10 +389,10 @@ write_fail:
     kprintf("  [OK] GENET Ethernet (BCM54213PE) available\n");
 #endif
 
-    /* Phase 21: Real LLM Inference (if model disk attached) */
-    sdlog("Phase21: LLM inference");
-    kprintf("\n[PHASE 21] Real LLM Inference Engine\n");
-    llm_run_eval();
+    /* Phase 10: LLM Model Loading (load only — no eval during boot) */
+    sdlog("Phase10: LLM load");
+    kprintf("\n[PHASE 10] AI Model Loader\n");
+    llm_boot_load();  /* Load model into RAM if disk present, but don't run eval */
 
     kstate.phase = KSTATE_RUNNING;
 
@@ -668,126 +400,48 @@ write_fail:
     sdlog("BC=99 ALL PHASES COMPLETE -- boot successful");
     sdlog_flush();
 
-    /* Final summary */
+    /* Boot summary */
     kprintf("\n============================================================\n");
-    kprintf("  TensorOS Boot Summary\n");
+    kprintf("  TensorOS v0.1.0 \"Neuron\" -- Boot Complete\n");
     kprintf("============================================================\n");
-    kprintf("  GEMM:       BLIS-style packed panels, 4x4 micro-kernel\n");
-    kprintf("              4x k-unroll, SW prefetch, panel packing\n");
 #if defined(__aarch64__)
-    kprintf("  Inference:  ARM64 NEON vectorized (zero overhead)\n");
+    kprintf("  Arch:     ARM64 (NEON 128-bit SIMD)\n");
 #else
-    kprintf("  Inference:  Graph JIT -> native x86_64 (zero overhead)\n");
+    kprintf("  Arch:     x86_64 (%s)\n",
+            cpu_features.avx2_usable ? "AVX2+FMA 256-bit" : "SSE2 128-bit");
 #endif
-    kprintf("  Batch:      GEMV->GEMM promotion for peak throughput\n");
-    kprintf("  Conv2D:     im2col + packed GEMM (CNN support)\n");
-    kprintf("  Winograd:   F(2,3) transform -- 2.25x fewer multiplies\n");
-    kprintf("  Quantized:  INT16 PMADDWD (2x throughput vs FP32)\n");
-    kprintf("  Training:   Backprop + Adam optimizer (learn at boot)\n");
-    kprintf("  NAS:        Neuroevolution (mu+lambda) architecture search\n");
-    kprintf("  Pipeline:   Train -> Quantize -> JIT -> Deploy\n");
-#if defined(__aarch64__)
-    kprintf("  SIMD:       NEON 4-wide (128-bit), 4x k-unrolled\n");
+    kprintf("  CPUs:     %d    RAM: %lu MB\n",
+            kstate.cpu_count, kstate.memory_total_bytes / (1024*1024));
+    kprintf("  Storage:  %s\n",
+#ifndef __aarch64__
+            virtio_blk_capacity() > 0 ? "virtio-blk" : "none");
 #else
-    kprintf("  SIMD:       SSE2 4-wide, 4x k-unrolled micro-kernel\n");
+            "SD/eMMC");
 #endif
-    kprintf("  Capacity:   Unlimited layers/neurons (heap-allocated)\n");
-    kprintf("  Edge AI:    Sensor anomaly detection at us-latency\n");
-    kprintf("  SNE:        Speculative Neural Execution (5 techniques)\n");
-    kprintf("              APC + SLF + EANP + DAG + Early Exit\n");
-    kprintf("  Transformer: KV-cache, RMSNorm, SwiGLU, MHA (LLM-ready)\n");
-    kprintf("  INT4:       Q4_0 block quant (6.4x compression, GGML-class)\n");
-    kprintf("  Arena:      O(1) bump alloc, 0%% frag, checkpoint/restore\n");
-    kprintf("  Math LLM:  5 micro-LLMs (arith, poly, trig, seq, calc)\n");
-    kprintf("  Real LLM:  GGUF loader + full transformer inference\n");
-    kprintf("             Qwen, Gemma, LLaMA, SmolLM, Mistral support\n");
-    kprintf("  ---- Production Hardening ----\n");
-#if defined(__aarch64__)
-    kprintf("  Exceptions: ARM64 EL1 exception vectors (sync, IRQ, FIQ)\n");
-    kprintf("  Timer:      ARM Generic Timer (CNTPCT_EL0), GIC-400\n");
-    kprintf("  CPU Detect: MIDR_EL1 (Cortex-A72, NEON, FP)\n");
-    kprintf("  NEON:       4-wide GEMM (128-bit, auto-vectorized)\n");
-#else
-    kprintf("  Exceptions: 32 CPU fault handlers (GPF, PF, DF, UD, ...)\n");
-    kprintf("              Full register dump + stack trace on fault\n");
-    kprintf("  Watchdog:   PIT-based tick counter (1000 Hz), SW watchdog\n");
-    kprintf("  CPU Detect: CPUID feature flags (SSE/AVX/FMA/BMI/AES)\n");
-    if (cpu_features.avx2_usable)
-        kprintf("  AVX2+FMA:   8-wide GEMM (256-bit YMM, 2x over SSE2)\n");
-#endif
-    kprintf("  Self-Test:  14 boot-time tests (mem, math, GEMM, alloc)\n");
-    kprintf("  ---- New Subsystems ----\n");
-    kprintf("  GGUF:       Model format parser (llama.cpp compatible)\n");
-#if defined(__aarch64__)
-    kprintf("  SMP:        ARM64 PSCI multicore (4 Cortex-A72)\n");
-    kprintf("  Storage:    SD/eMMC via EMMC2 (BCM2711)\n");
-    kprintf("  Network:    GENET Ethernet (BCM54213PE)\n");
-    kprintf("  Bluetooth:  SPP serial console (pair to 'TensorOS')\n");
-#else
-    kprintf("  SMP:        Multi-core LAPIC + INIT-SIPI-SIPI bootstrap\n");
-    kprintf("  Virtio-blk: PCI block device (model loading from disk)\n");
-    kprintf("  Virtio-net: PCI NIC + ARP/IPv4/UDP/ICMP stack\n");
-    kprintf("  Inference:  UDP:8080 API server (PING/INFO/INFER)\n");
-#endif
-    kprintf("  Hardware:   %d CPU(s), %d GPU(s), %d TPU(s), 4G RAM\n",
-            kstate.cpu_count, kstate.gpu_count, kstate.tpu_count);
+    {
+        extern int llm_is_loaded(void);
+        extern const char *llm_model_name(void);
+        if (llm_is_loaded())
+            kprintf("  LLM:      %s (ready)\n", llm_model_name());
+        else
+            kprintf("  LLM:      (none -- attach GGUF disk)\n");
+    }
     kprintf("============================================================\n");
 
-    kprintf("\n[READY] TensorOS is operational. %d CPUs, %d GPUs, %d TPUs\n",
-            kstate.cpu_count, kstate.gpu_count, kstate.tpu_count);
+    kprintf("\n[READY] TensorOS is operational. %d CPUs, %lu MB RAM\n",
+            kstate.cpu_count, kstate.memory_total_bytes / (1024*1024));
 
     /* Enable interrupts for keyboard/timer */
     sti();
 
-    /* Auto-detect interactive mode: wait ~2 seconds for keyboard/serial input.
-     * If no input arrives, assume headless benchmark mode and exit.
-     * If a key arrives, enter the interactive shell. */
-    kprintf("[READY] Press any key for interactive shell (auto-exit in 2s)...\n");
+    /* Always enter the interactive shell — this is an OS, not a batch runner.
+     * The shell accepts keyboard input (PS/2 IRQ1) and serial (COM1).
+     * Type 'help' for commands, 'exit' to shutdown. */
+    kprintf("\n[READY] Entering TensorOS shell (type 'help' for commands)\n\n");
     {
-        extern uint64_t perf_tsc_mhz(void);
-        uint64_t deadline_cycles = 2ULL * perf_tsc_mhz() * 1000000ULL; /* 2 seconds */
-        uint64_t start;
-#if defined(__aarch64__)
-        start = rdtsc_fenced();
-
-        int got_key = 0;
-        while (1) {
-            if (keyboard_has_key()) { got_key = 1; break; }
-            uint64_t now = rdtsc_fenced();
-            if (now - start >= deadline_cycles) break;
-            bt_poll();  /* Keep BT alive during wait */
-            __asm__ volatile ("wfi");
-        }
-#else
-        __asm__ volatile ("rdtsc" : "=A"(start)); /* Note: only low 32 bits */
-        /* Use proper fenced 64-bit read */
-        uint32_t lo, hi;
-        __asm__ volatile ("lfence; rdtsc" : "=a"(lo), "=d"(hi));
-        start = ((uint64_t)hi << 32) | lo;
-
-        int got_key = 0;
-        while (1) {
-            /* Check keyboard buffer */
-            if (keyboard_has_key()) { got_key = 1; break; }
-            /* Check serial input */
-            if (inb(0x3F8 + 5) & 0x01) { got_key = 1; break; }
-            /* Check timeout */
-            uint32_t lo2, hi2;
-            __asm__ volatile ("lfence; rdtsc" : "=a"(lo2), "=d"(hi2));
-            uint64_t now = ((uint64_t)hi2 << 32) | lo2;
-            if (now - start >= deadline_cycles) break;
-            __asm__ volatile ("hlt");
-        }
-#endif
-
-        if (got_key) {
-            kprintf("[READY] Entering interactive shell\n");
-            extern void aishell_main(void);
-            aishell_main();
-            kprintf("[SHUTDOWN] TensorOS shutting down...\n");
-        } else {
-            kprintf("[READY] No input detected - headless mode, exiting\n");
-        }
+        extern void aishell_main(void);
+        aishell_main();
+        kprintf("[SHUTDOWN] TensorOS shutting down...\n");
     }
 
     cli();

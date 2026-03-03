@@ -59,6 +59,16 @@ typedef void (*jit_matmul_fn)(float *C, const float *A, const float *B,
 typedef void (*jit_unary_fn)(float *out, const float *in, int n);
 typedef void (*jit_binary_fn)(float *out, const float *a, const float *b, int n);
 
+/* GEMV: out[rows] = W[rows × cols_quant] · x[cols], W is Q8_0 blocked */
+typedef void (*jit_gemv_q8_fn)(float *out, const void *weight, const float *x,
+                                int rows, int cols);
+
+/* Fused SiLU: x[i] = x[i] * sigmoid(x[i]) */
+typedef void (*jit_silu_fn)(float *x, int n);
+
+/* RMSNorm: out[dim] = normalize(x) * weight */
+typedef void (*jit_rmsnorm_fn)(float *out, const float *x, const float *w, int dim);
+
 /* =============================================================================
  * Buffer Management
  * =============================================================================*/
@@ -150,6 +160,12 @@ jit_unary_fn jit_compile_relu_kernel(int n);
 
 /* Compile fused matmul+relu (single pass, no intermediate storage) */
 jit_matmul_fn jit_compile_fused_matmul_relu(int M, int N, int K);
+
+/* Compile Q8_0 GEMV kernel specialized for given dimensions */
+jit_gemv_q8_fn jit_compile_q8_gemv(int rows, int cols);
+
+/* Compile vectorized SiLU kernel for given size */
+jit_silu_fn jit_compile_silu_kernel(int n);
 
 /* Get number of JIT-compiled kernels cached */
 int jit_kernel_count(void);

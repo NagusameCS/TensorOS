@@ -21,6 +21,7 @@
 #include "kernel/core/kernel.h"
 #include "kernel/core/perf.h"
 #include "runtime/nn/gguf.h"
+#include "runtime/jit/x86_jit.h"
 #ifndef __aarch64__
 #include "kernel/drivers/blk/virtio_blk.h"
 #endif
@@ -144,32 +145,74 @@ typedef struct { uint16_t d; uint8_t qs[16]; } __attribute__((packed)) ggml_q4_0
 /* GGML Q8_0 block: {fp16 scale, int8[32]}  = 34 bytes for 32 elements */
 typedef struct { uint16_t d; int8_t  qs[32]; } __attribute__((packed)) ggml_q8_0_t;
 
-/* Dot product: Q4_0 block · float[32] */
+/* Dot product: Q4_0 block · float[32] — SSE2 optimized */
 static float q4_0_dot32(const ggml_q4_0_t *block, const float *x)
 {
     float d = fp16_to_fp32(block->d);
-    float sum = 0.0f;
+    const uint8_t *qs = block->qs;
 
+#ifndef __aarch64__
+    /* SSE2: process 4 bytes (8 nibbles = 8 elements) per iteration, 4 iterations */
+    v4f acc0 = {0, 0, 0, 0};
+    v4f acc1 = {0, 0, 0, 0};
+
+    for (int j = 0; j < 16; j += 4) {
+        uint8_t b0 = qs[j], b1 = qs[j+1], b2 = qs[j+2], b3 = qs[j+3];
+        /* Interleaved: lo0,hi0, lo1,hi1, lo2,hi2, lo3,hi3 = 8 floats */
+        v4f q0 = {(float)((int)(b0 & 0xF) - 8), (float)((int)(b0 >> 4) - 8),
+                  (float)((int)(b1 & 0xF) - 8), (float)((int)(b1 >> 4) - 8)};
+        v4f q1 = {(float)((int)(b2 & 0xF) - 8), (float)((int)(b2 >> 4) - 8),
+                  (float)((int)(b3 & 0xF) - 8), (float)((int)(b3 >> 4) - 8)};
+        v4f x0 = *(const v4f *)(x + 2*j);
+        v4f x1 = *(const v4f *)(x + 2*j + 4);
+        acc0 += q0 * x0;
+        acc1 += q1 * x1;
+    }
+
+    v4f acc = acc0 + acc1;
+    union { v4f v; float f[4]; } u = { .v = acc };
+    return (u.f[0] + u.f[1] + u.f[2] + u.f[3]) * d;
+#else
+    float sum = 0.0f;
     for (int j = 0; j < 16; j++) {
-        uint8_t packed = block->qs[j];
+        uint8_t packed = qs[j];
         int lo = (int)(packed & 0x0F) - 8;
         int hi = (int)(packed >> 4)   - 8;
-        sum += (float)lo * x[2 * j]     +
-               (float)hi * x[2 * j + 1];
+        sum += (float)lo * x[2 * j] + (float)hi * x[2 * j + 1];
     }
     return sum * d;
+#endif
 }
 
-/* Dot product: Q8_0 block · float[32] */
+/* Dot product: Q8_0 block · float[32] — SSE2 optimized */
 static float q8_0_dot32(const ggml_q8_0_t *block, const float *x)
 {
     float d = fp16_to_fp32(block->d);
-    float sum = 0.0f;
+    const int8_t *qs = block->qs;
 
-    for (int j = 0; j < 32; j++) {
-        sum += (float)block->qs[j] * x[j];
+#ifndef __aarch64__
+    /* SSE2: dual v4f accumulators, 4 iterations of 8 elements */
+    v4f acc0 = {0, 0, 0, 0};
+    v4f acc1 = {0, 0, 0, 0};
+
+    for (int j = 0; j < 32; j += 8) {
+        v4f q0 = {(float)qs[j], (float)qs[j+1], (float)qs[j+2], (float)qs[j+3]};
+        v4f q1 = {(float)qs[j+4], (float)qs[j+5], (float)qs[j+6], (float)qs[j+7]};
+        v4f x0 = *(const v4f *)(x + j);
+        v4f x1 = *(const v4f *)(x + j + 4);
+        acc0 += q0 * x0;
+        acc1 += q1 * x1;
     }
+
+    v4f acc = acc0 + acc1;
+    union { v4f v; float f[4]; } u = { .v = acc };
+    return (u.f[0] + u.f[1] + u.f[2] + u.f[3]) * d;
+#else
+    float sum = 0.0f;
+    for (int j = 0; j < 32; j++)
+        sum += (float)qs[j] * x[j];
     return sum * d;
+#endif
 }
 
 /* Generic vector dot product: quantized weight row · float input
@@ -195,22 +238,48 @@ static float llm_vec_dot(const void *weight, const float *x, int n, ggml_type_t 
     }
     case GGML_TYPE_F16: {
         const uint16_t *f16 = (const uint16_t *)weight;
+#ifndef __aarch64__
+        v4f acc = {0, 0, 0, 0};
+        int i = 0;
+        for (; i + 4 <= n; i += 4) {
+            v4f w = {fp16_to_fp32(f16[i]), fp16_to_fp32(f16[i+1]),
+                     fp16_to_fp32(f16[i+2]), fp16_to_fp32(f16[i+3])};
+            v4f vx = *(const v4f *)(x + i);
+            acc += w * vx;
+        }
+        union { v4f v; float f[4]; } u = { .v = acc };
+        sum += u.f[0] + u.f[1] + u.f[2] + u.f[3];
+        for (; i < n; i++)
+            sum += fp16_to_fp32(f16[i]) * x[i];
+#else
         for (int i = 0; i < n; i++)
             sum += fp16_to_fp32(f16[i]) * x[i];
+#endif
         break;
     }
     case GGML_TYPE_F32: {
         const float *f32 = (const float *)weight;
+#ifndef __aarch64__
+        v4f acc0 = {0, 0, 0, 0};
+        v4f acc1 = {0, 0, 0, 0};
         int i = 0;
-        for (; i + 4 <= n; i += 4) {
-            v4f vw = *(const v4f *)(f32 + i);
-            v4f vx = *(const v4f *)(x + i);
-            v4f p = vw * vx;
-            union { v4f v; float f[4]; } u = { .v = p };
-            sum += u.f[0] + u.f[1] + u.f[2] + u.f[3];
+        for (; i + 8 <= n; i += 8) {
+            v4f w0 = *(const v4f *)(f32 + i);
+            v4f w1 = *(const v4f *)(f32 + i + 4);
+            v4f x0 = *(const v4f *)(x + i);
+            v4f x1 = *(const v4f *)(x + i + 4);
+            acc0 += w0 * x0;
+            acc1 += w1 * x1;
         }
+        v4f a = acc0 + acc1;
+        union { v4f v; float f[4]; } u = { .v = a };
+        sum += u.f[0] + u.f[1] + u.f[2] + u.f[3];
         for (; i < n; i++)
             sum += f32[i] * x[i];
+#else
+        for (int i = 0; i < n; i++)
+            sum += f32[i] * x[i];
+#endif
         break;
     }
     default:
@@ -232,10 +301,45 @@ static uint64_t llm_row_bytes(int in_dim, ggml_type_t type)
 }
 
 /* GEMV: out[out_dim] = weight[out_dim × in_dim] · x[in_dim]
- * weight is in quantized GGML format (row-major) */
+ * weight is in quantized GGML format (row-major)
+ * Tries JIT-compiled Q8_0 kernel first, falls back to vec_dot loop. */
+static jit_gemv_q8_fn llm_jit_gemv_cache[8] = {0};
+static int llm_jit_gemv_rows[8] = {0};
+static int llm_jit_gemv_cols[8] = {0};
+static int llm_jit_gemv_n = 0;
+
+static jit_gemv_q8_fn llm_get_jit_gemv(int rows, int cols)
+{
+    /* Check local cache first (fast path) */
+    for (int i = 0; i < llm_jit_gemv_n; i++) {
+        if (llm_jit_gemv_rows[i] == rows && llm_jit_gemv_cols[i] == cols)
+            return llm_jit_gemv_cache[i];
+    }
+    /* Try to compile */
+    jit_gemv_q8_fn fn = jit_compile_q8_gemv(rows, cols);
+    if (fn && llm_jit_gemv_n < 8) {
+        llm_jit_gemv_rows[llm_jit_gemv_n] = rows;
+        llm_jit_gemv_cols[llm_jit_gemv_n] = cols;
+        llm_jit_gemv_cache[llm_jit_gemv_n] = fn;
+        llm_jit_gemv_n++;
+    }
+    return fn;
+}
+
 static void llm_gemv(float *out, const void *weight, const float *x,
                      int out_dim, int in_dim, ggml_type_t type)
 {
+#ifndef __aarch64__
+    /* Try JIT-compiled Q8_0 GEMV kernel */
+    if (type == GGML_TYPE_Q8_0) {
+        jit_gemv_q8_fn jfn = llm_get_jit_gemv(out_dim, in_dim);
+        if (jfn) {
+            jfn(out, weight, x, out_dim, in_dim);
+            return;
+        }
+    }
+#endif
+
     uint64_t rb = llm_row_bytes(in_dim, type);
 
     for (int i = 0; i < out_dim; i++) {
@@ -312,6 +416,31 @@ static void llm_embed(float *out, const llm_model_t *m, int token_id)
 static void llm_rmsnorm(float *out, const float *x, const void *w,
                         int dim, ggml_type_t wtype)
 {
+#ifndef __aarch64__
+    /* SSE2-vectorized sum of squares */
+    v4f ss_vec = {0, 0, 0, 0};
+    int i = 0;
+    for (; i + 4 <= dim; i += 4) {
+        v4f v = *(const v4f *)(x + i);
+        ss_vec += v * v;
+    }
+    union { v4f v; float f[4]; } u = { .v = ss_vec };
+    float ss = u.f[0] + u.f[1] + u.f[2] + u.f[3];
+    for (; i < dim; i++)
+        ss += x[i] * x[i];
+    ss = 1.0f / llm_sqrtf(ss / (float)dim + 1e-6f);
+
+    /* Vectorized normalize + weight multiply */
+    v4f ss_v = {ss, ss, ss, ss};
+    for (i = 0; i + 4 <= dim; i += 4) {
+        v4f xv = *(const v4f *)(x + i);
+        v4f wv = {llm_get_f(w, i, wtype), llm_get_f(w, i+1, wtype),
+                  llm_get_f(w, i+2, wtype), llm_get_f(w, i+3, wtype)};
+        *(v4f *)(out + i) = xv * ss_v * wv;
+    }
+    for (; i < dim; i++)
+        out[i] = x[i] * ss * llm_get_f(w, i, wtype);
+#else
     float ss = 0.0f;
     for (int i = 0; i < dim; i++)
         ss += x[i] * x[i];
@@ -319,6 +448,7 @@ static void llm_rmsnorm(float *out, const float *x, const void *w,
 
     for (int i = 0; i < dim; i++)
         out[i] = x[i] * ss * llm_get_f(w, i, wtype);
+#endif
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -386,8 +516,19 @@ static void llm_softmax(float *x, int n)
         sum += x[i];
     }
     float inv = 1.0f / (sum + 1e-10f);
+#ifndef __aarch64__
+    v4f inv_v = {inv, inv, inv, inv};
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        v4f v = *(const v4f *)(x + i);
+        *(v4f *)(x + i) = v * inv_v;
+    }
+    for (; i < n; i++)
+        x[i] *= inv;
+#else
     for (int i = 0; i < n; i++)
         x[i] *= inv;
+#endif
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -400,6 +541,94 @@ static void llm_silu(float *x, int n)
         float s = 1.0f / (1.0f + llm_expf(-x[i]));
         x[i] = x[i] * s;
     }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  SSE2-vectorized helpers for attention inner loops                           */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+/* Dot product of two float arrays, SSE2-optimized */
+static float llm_dot_f32(const float *a, const float *b, int n)
+{
+#ifndef __aarch64__
+    v4f acc0 = {0, 0, 0, 0};
+    v4f acc1 = {0, 0, 0, 0};
+    int i = 0;
+    for (; i + 8 <= n; i += 8) {
+        v4f a0 = *(const v4f *)(a + i);
+        v4f a1 = *(const v4f *)(a + i + 4);
+        v4f b0 = *(const v4f *)(b + i);
+        v4f b1 = *(const v4f *)(b + i + 4);
+        acc0 += a0 * b0;
+        acc1 += a1 * b1;
+    }
+    v4f acc = acc0 + acc1;
+    union { v4f v; float f[4]; } u = { .v = acc };
+    float sum = u.f[0] + u.f[1] + u.f[2] + u.f[3];
+    for (; i < n; i++)
+        sum += a[i] * b[i];
+    return sum;
+#else
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++)
+        sum += a[i] * b[i];
+    return sum;
+#endif
+}
+
+/* Scaled add: dst[i] += scale * src[i], SSE2-optimized */
+static void llm_axpy_f32(float *dst, float scale, const float *src, int n)
+{
+#ifndef __aarch64__
+    v4f sv = {scale, scale, scale, scale};
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        v4f d = *(const v4f *)(dst + i);
+        v4f s = *(const v4f *)(src + i);
+        *(v4f *)(dst + i) = d + sv * s;
+    }
+    for (; i < n; i++)
+        dst[i] += scale * src[i];
+#else
+    for (int i = 0; i < n; i++)
+        dst[i] += scale * src[i];
+#endif
+}
+
+/* Vector add: dst[i] += src[i], SSE2-optimized */
+static void llm_vadd_f32(float *dst, const float *src, int n)
+{
+#ifndef __aarch64__
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        v4f d = *(const v4f *)(dst + i);
+        v4f s = *(const v4f *)(src + i);
+        *(v4f *)(dst + i) = d + s;
+    }
+    for (; i < n; i++)
+        dst[i] += src[i];
+#else
+    for (int i = 0; i < n; i++)
+        dst[i] += src[i];
+#endif
+}
+
+/* Element-wise multiply: dst[i] *= src[i], SSE2-optimized */
+static void llm_vmul_f32(float *dst, const float *src, int n)
+{
+#ifndef __aarch64__
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        v4f d = *(const v4f *)(dst + i);
+        v4f s = *(const v4f *)(src + i);
+        *(v4f *)(dst + i) = d * s;
+    }
+    for (; i < n; i++)
+        dst[i] *= src[i];
+#else
+    for (int i = 0; i < n; i++)
+        dst[i] *= src[i];
+#endif
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -465,10 +694,7 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
             int seq_len = pos + 1;
             for (int t = 0; t < seq_len; t++) {
                 float *kt = m->k_cache + L * kv_stride + t * kv_dim + kv_h * hd;
-                float dot = 0.0f;
-                for (int d = 0; d < hd; d++)
-                    dot += qh[d] * kt[d];
-                llm_attn_scores[t] = dot * scale;
+                llm_attn_scores[t] = llm_dot_f32(qh, kt, hd) * scale;
             }
 
             /* Softmax over scores */
@@ -479,8 +705,7 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
             for (int t = 0; t < seq_len; t++) {
                 float s = llm_attn_scores[t];
                 float *vt = m->v_cache + L * kv_stride + t * kv_dim + kv_h * hd;
-                for (int d = 0; d < hd; d++)
-                    llm_head_buf[d] += s * vt[d];
+                llm_axpy_f32(llm_head_buf, s, vt, hd);
             }
 
             /* Copy head output to concat buffer */
@@ -490,8 +715,7 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
 
         /* 2f. Output projection + residual */
         llm_gemv(llm_ffn_d, layer->o_weight, llm_attn_out, dim, dim, layer->o_type);
-        for (int i = 0; i < dim; i++)
-            llm_x[i] += llm_ffn_d[i];
+        llm_vadd_f32(llm_x, llm_ffn_d, dim);
 
         /* === Feed-Forward Network (SwiGLU) === */
 
@@ -502,13 +726,11 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
         llm_gemv(llm_ffn_g, layer->ffn_gate, llm_xn, ff, dim, layer->gate_type);
         llm_gemv(llm_ffn_u, layer->ffn_up,   llm_xn, ff, dim, layer->up_type);
         llm_silu(llm_ffn_g, ff);
-        for (int i = 0; i < ff; i++)
-            llm_ffn_g[i] *= llm_ffn_u[i];
+        llm_vmul_f32(llm_ffn_g, llm_ffn_u, ff);
 
         /* 2i. Down projection + residual */
         llm_gemv(llm_ffn_d, layer->ffn_down, llm_ffn_g, dim, ff, layer->down_type);
-        for (int i = 0; i < dim; i++)
-            llm_x[i] += llm_ffn_d[i];
+        llm_vadd_f32(llm_x, llm_ffn_d, dim);
     }
 
     /* 3. Final RMSNorm */
@@ -637,6 +859,10 @@ static int llm_build_vocab(llm_model_t *m, gguf_ctx_t *ctx)
 
     kprintf("[LLM] Vocab: %d tokens, BOS=%d, EOS=%d\n",
             n_vocab, m->bos_id, m->eos_id);
+
+    /* Build hash table for O(1) token lookups */
+    llm_build_hash_table(m);
+
     return 0;
 }
 
@@ -649,9 +875,60 @@ static int llm_str_match(const char *a, int alen, const char *b, int blen)
     return 1;
 }
 
-/* Find exact token ID for a string. Returns -1 if not found. */
+/* FNV-1a hash for (string, length) pairs */
+static uint32_t llm_hash_str(const char *str, int len)
+{
+    uint32_t h = 0x811c9dc5u;
+    for (int i = 0; i < len; i++) {
+        h ^= (uint8_t)str[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
+
+/* Hash-table backed token lookup — O(1) average */
+static int16_t llm_vocab_ht[LLM_HASH_SIZE];
+static int llm_ht_ready = 0;
+
+static void llm_build_hash_table(const llm_model_t *m)
+{
+    /* Initialize all slots to -1 (empty) */
+    for (int i = 0; i < LLM_HASH_SIZE; i++)
+        llm_vocab_ht[i] = -1;
+
+    /* Insert all vocab entries using open addressing (linear probing) */
+    for (int i = 0; i < m->n_vocab; i++) {
+        uint32_t h = llm_hash_str(m->vocab[i].str, m->vocab[i].len);
+        uint32_t slot = h & (LLM_HASH_SIZE - 1);
+        int probes = 0;
+        while (llm_vocab_ht[slot] != -1 && probes < LLM_HASH_SIZE) {
+            slot = (slot + 1) & (LLM_HASH_SIZE - 1);
+            probes++;
+        }
+        if (probes < LLM_HASH_SIZE)
+            llm_vocab_ht[slot] = (int16_t)i;
+    }
+    llm_ht_ready = 1;
+}
+
+/* Find exact token ID for a string. Hash table O(1) with fallback. */
 static int llm_find_token(const llm_model_t *m, const char *str, int len)
 {
+    if (llm_ht_ready) {
+        uint32_t h = llm_hash_str(str, len);
+        uint32_t slot = h & (LLM_HASH_SIZE - 1);
+        int probes = 0;
+        while (probes < 64) { /* limit probe length */
+            int16_t idx = llm_vocab_ht[slot];
+            if (idx == -1) return -1; /* empty slot = not found */
+            if (llm_str_match(m->vocab[idx].str, m->vocab[idx].len, str, len))
+                return idx;
+            slot = (slot + 1) & (LLM_HASH_SIZE - 1);
+            probes++;
+        }
+        return -1;
+    }
+    /* Fallback: linear scan (before hash table is built) */
     for (int i = 0; i < m->n_vocab; i++) {
         if (llm_str_match(m->vocab[i].str, m->vocab[i].len, str, len))
             return i;
@@ -862,28 +1139,90 @@ static int llm_argmax(const float *logits, int n)
     return best;
 }
 
-/* Simple temperature sampling with top-1 (greedy when temp=0) */
+/* Sort indices by descending logit value (insertion sort for top-k) */
+static void llm_partial_sort_desc(int *indices, const float *vals, int n, int k)
+{
+    /* Initialize first k indices */
+    for (int i = 0; i < k && i < n; i++)
+        indices[i] = i;
+
+    /* Sort first k by insertion sort */
+    for (int i = 1; i < k && i < n; i++) {
+        int key = indices[i];
+        float key_val = vals[key];
+        int j = i - 1;
+        while (j >= 0 && vals[indices[j]] < key_val) {
+            indices[j + 1] = indices[j];
+            j--;
+        }
+        indices[j + 1] = key;
+    }
+
+    /* For remaining elements, insert if larger than smallest in top-k */
+    for (int i = k; i < n; i++) {
+        int last = (k < n) ? k - 1 : n - 1;
+        if (vals[i] > vals[indices[last]]) {
+            indices[last] = i;
+            /* Bubble up */
+            int j = last - 1;
+            while (j >= 0 && vals[indices[j]] < vals[indices[j + 1]]) {
+                int tmp = indices[j]; indices[j] = indices[j + 1]; indices[j + 1] = tmp;
+                j--;
+            }
+        }
+    }
+}
+
+/* Top-k + top-p (nucleus) sampling with temperature */
 static int llm_sample(const float *logits, int vocab_size, float temperature)
 {
     if (temperature <= 0.001f)
         return llm_argmax(logits, vocab_size);
 
-    /* Apply temperature */
-    static float probs[LLM_MAX_VOCAB];
-    float max_val = logits[0];
-    for (int i = 1; i < vocab_size; i++)
-        if (logits[i] > max_val) max_val = logits[i];
+    /* Top-k filtering: keep only top 40 candidates */
+    #define LLM_TOP_K 40
+    static int top_indices[LLM_TOP_K];
+    static float top_probs[LLM_TOP_K];
 
+    int k = LLM_TOP_K;
+    if (k > vocab_size) k = vocab_size;
+
+    llm_partial_sort_desc(top_indices, logits, vocab_size, k);
+
+    /* Apply temperature and compute softmax over top-k */
+    float max_val = logits[top_indices[0]];
     float sum = 0.0f;
-    for (int i = 0; i < vocab_size; i++) {
-        probs[i] = llm_expf((logits[i] - max_val) / temperature);
-        sum += probs[i];
+    for (int i = 0; i < k; i++) {
+        top_probs[i] = llm_expf((logits[top_indices[i]] - max_val) / temperature);
+        sum += top_probs[i];
     }
     float inv_sum = 1.0f / (sum + 1e-10f);
-    for (int i = 0; i < vocab_size; i++)
-        probs[i] *= inv_sum;
+    for (int i = 0; i < k; i++)
+        top_probs[i] *= inv_sum;
 
-    /* Sample using pseudo-random (deterministic from TSC) */
+    /* Top-p (nucleus) filtering: keep tokens until cumulative prob >= 0.9 */
+    float top_p = 0.9f;
+    float cum = 0.0f;
+    int p_cutoff = k;
+    for (int i = 0; i < k; i++) {
+        cum += top_probs[i];
+        if (cum >= top_p) {
+            p_cutoff = i + 1;
+            break;
+        }
+    }
+
+    /* Re-normalize after top-p cutoff */
+    if (p_cutoff < k) {
+        sum = 0.0f;
+        for (int i = 0; i < p_cutoff; i++)
+            sum += top_probs[i];
+        inv_sum = 1.0f / (sum + 1e-10f);
+        for (int i = 0; i < p_cutoff; i++)
+            top_probs[i] *= inv_sum;
+    }
+
+    /* Sample using pseudo-random (from TSC) */
     uint32_t lo, hi;
 #if defined(__aarch64__)
     uint64_t cnt;
@@ -892,14 +1231,18 @@ static int llm_sample(const float *logits, int vocab_size, float temperature)
 #else
     __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
 #endif
+    /* Better randomness: mix upper bits */
+    lo = lo ^ (lo >> 16);
+    lo = lo * 0x45d9f3bU;
     float r = (float)(lo % 10000) / 10000.0f;
 
     float cdf = 0.0f;
-    for (int i = 0; i < vocab_size; i++) {
-        cdf += probs[i];
-        if (cdf >= r) return i;
+    for (int i = 0; i < p_cutoff; i++) {
+        cdf += top_probs[i];
+        if (cdf >= r) return top_indices[i];
     }
-    return vocab_size - 1;
+    return top_indices[p_cutoff - 1];
+    #undef LLM_TOP_K
 }
 
 /* Generate text tokens autoregressively.
@@ -907,18 +1250,25 @@ static int llm_sample(const float *logits, int vocab_size, float temperature)
  * output_text: buffer for generated text
  * max_gen: maximum tokens to generate
  * temperature: sampling temperature (0.0 = greedy)
+ * continue_cache: if nonzero, don't reset KV cache (multi-turn)
  * Returns: number of generated tokens */
 static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
                         char *output_text, int max_text_len,
-                        int max_gen, float temperature)
+                        int max_gen, float temperature, int continue_cache)
 {
-    /* Reset KV cache */
-    m->cache_len = 0;
-    int kv_total = m->n_layers * m->max_seq * m->n_kv_heads * m->head_dim;
-    if (kv_total > LLM_KV_FLOATS) kv_total = LLM_KV_FLOATS;
-    for (int i = 0; i < kv_total; i++) {
-        m->k_cache[i] = 0.0f;
-        m->v_cache[i] = 0.0f;
+    int start_pos = 0;
+
+    if (!continue_cache) {
+        /* Reset KV cache */
+        m->cache_len = 0;
+        int kv_total = m->n_layers * m->max_seq * m->n_kv_heads * m->head_dim;
+        if (kv_total > LLM_KV_FLOATS) kv_total = LLM_KV_FLOATS;
+        for (int i = 0; i < kv_total; i++) {
+            m->k_cache[i] = 0.0f;
+            m->v_cache[i] = 0.0f;
+        }
+    } else {
+        start_pos = m->cache_len;
     }
 
     int out_pos = 0;
@@ -926,13 +1276,13 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
     output_text[0] = '\0';
 
     /* Process prompt tokens (prefill) */
-    for (int i = 0; i < n_prompt && i < m->max_seq - 1; i++) {
-        llm_forward_token(m, llm_logits, prompt_tokens[i], i);
+    for (int i = 0; i < n_prompt && (start_pos + i) < m->max_seq - 1; i++) {
+        llm_forward_token(m, llm_logits, prompt_tokens[i], start_pos + i);
     }
 
     /* Generate new tokens */
     int last_token = (n_prompt > 0) ? prompt_tokens[n_prompt - 1] : m->bos_id;
-    int pos = n_prompt;
+    int pos = start_pos + n_prompt;
 
     /* Get next token from the last forward pass */
     int next = llm_sample(llm_logits, m->vocab_size, temperature);
@@ -965,18 +1315,18 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
             if (stop) break;
         }
 
-        /* Stop after 2 newlines (model is rambling) */
+        /* Stop after 4 newlines (model is rambling) */
         {
             int nl_count = 0;
             for (int i = 0; i < out_pos; i++)
                 if (output_text[i] == '\n') nl_count++;
-            if (nl_count >= 2) {
-                /* Truncate at second newline */
+            if (nl_count >= 4) {
+                /* Truncate at 4th newline */
                 int nl_seen = 0;
                 for (int i = 0; i < out_pos; i++) {
                     if (output_text[i] == '\n') {
                         nl_seen++;
-                        if (nl_seen >= 2) {
+                        if (nl_seen >= 4) {
                             output_text[i] = '\0';
                             out_pos = i;
                             break;
@@ -1009,6 +1359,9 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
         while (out_pos > 0 && (output_text[out_pos-1] == ' ' || output_text[out_pos-1] == '\n'))
             output_text[--out_pos] = '\0';
     }
+
+    /* Update cache length for multi-turn */
+    m->cache_len = pos;
 
     return gen_count;
 }
@@ -1207,17 +1560,10 @@ static int llm_load_from_disk(llm_model_t *m)
         kstrcpy(m->name, m->arch);
     }
 
-    /* Print model info */
+    /* Print model info (concise for boot) */
     kprintf("[LLM] Model: %s (%s)\n", m->name, m->arch);
-    kprintf("[LLM] Parameters: dim=%d, layers=%d, heads=%d, kv_heads=%d\n",
-            m->dim, m->n_layers, m->n_heads, m->n_kv_heads);
-    kprintf("[LLM] FFN=%d, vocab=%d, head_dim=%d, RoPE base=",
-            m->ff_dim, m->vocab_size, m->head_dim);
-    /* Print rope_base as integer if it's a round number */
-    if (m->rope_base == (float)(int)m->rope_base && m->rope_base < 1e7f)
-        kprintf("%d\n", (int)m->rope_base);
-    else
-        kprintf("~%d\n", (int)m->rope_base);
+    kprintf("[LLM] %d layers, %d-dim, %d vocab, %d heads (%d KV)\n",
+            m->n_layers, m->dim, m->vocab_size, m->n_heads, m->n_kv_heads);
 
     /* Validate dimensions */
     if (m->dim > LLM_MAX_DIM) {
@@ -1261,7 +1607,6 @@ static int llm_load_from_disk(llm_model_t *m)
     m->cache_len = 0;
 
     kprintf("[LLM] Model loaded successfully! Ready for inference.\n");
-    gguf_print_info(&llm_gguf_ctx);
 
     return 0;
 #endif /* __aarch64__ */
@@ -1406,7 +1751,7 @@ static void llm_run_math_eval(llm_model_t *m)
         /* Generate */
         uint64_t t0 = rdtsc_fenced();
         int n_gen = llm_generate(m, llm_tokens, n_tokens, output_buf, sizeof(output_buf),
-                                 16, 0.0f); /* greedy, max 16 tokens */
+                                 16, 0.0f, 0); /* greedy, max 16 tokens, fresh cache */
         uint64_t t1 = rdtsc_fenced();
 
         uint64_t gen_ms = perf_cycles_to_us(t1 - t0) / 1000;
@@ -1489,6 +1834,63 @@ static void llm_run_benchmark(llm_model_t *m)
 /*  Main Entry Point                                                           */
 /* ─────────────────────────────────────────────────────────────────────────── */
 
+/* Boot-time model loader: load GGUF from disk into RAM, but don't run eval.
+ * This is called during boot for fast startup. */
+void llm_boot_load(void)
+{
+#ifdef __aarch64__
+    kprintf("  [--] ARM64 disk loading not yet available\n");
+    return;
+#else
+    uint64_t capacity = virtio_blk_capacity();
+    if (capacity == 0) {
+        kprintf("  [--] No model disk (use 'llm' in shell for instructions)\n");
+        return;
+    }
+
+    /* Verify GGUF magic */
+    {
+        static uint8_t hdr_buf[512];
+        int rc = virtio_blk_read(0, 1, hdr_buf);
+        if (rc != 0) {
+            kprintf("  [--] Failed to read disk\n");
+            return;
+        }
+        uint32_t magic = (uint32_t)hdr_buf[0] | ((uint32_t)hdr_buf[1] << 8) |
+                         ((uint32_t)hdr_buf[2] << 16) | ((uint32_t)hdr_buf[3] << 24);
+        if (magic != GGUF_MAGIC) {
+            kprintf("  [--] Disk is not a GGUF model file\n");
+            return;
+        }
+    }
+
+    kprintf("  Loading %lu MB model from disk...\n", capacity / (1024 * 1024));
+
+    kmemset(&llm_model, 0, sizeof(llm_model));
+    int rc = llm_load_from_disk(&llm_model);
+    if (rc != 0) {
+        kprintf("  [FAIL] Model load error: %d\n", rc);
+        return;
+    }
+
+    kprintf("  [OK] %s (%d layers, %lu params)\n",
+            llm_model.name, llm_model.n_layers,
+            (uint64_t)llm_model.vocab_size * llm_model.dim);
+#endif
+}
+
+/* Full eval (benchmarks + math) — callable from shell via 'demo llm' */
+void llm_run_full_eval(void)
+{
+    if (!llm_is_loaded()) {
+        kprintf("[LLM] No model loaded.\n");
+        return;
+    }
+    llm_run_benchmark(&llm_model);
+    llm_run_math_eval(&llm_model);
+    kprintf("\n[LLM] Evaluation complete.\n");
+}
+
 void llm_run_eval(void)
 {
     kprintf("\n============================================================\n");
@@ -1563,4 +1965,89 @@ void llm_run_eval(void)
 
     kprintf("\n[LLM] Evaluation complete.\n");
 #endif
+}
+
+/* =============================================================================
+ * Interactive LLM prompt — called from the shell
+ * =============================================================================*/
+int llm_is_loaded(void)
+{
+    return (llm_model.vocab_size > 0 && llm_model.data_buf != NULL);
+}
+
+const char *llm_model_name(void)
+{
+    if (!llm_is_loaded()) return "(none)";
+    return llm_model.name;
+}
+
+int llm_prompt(const char *user_text, char *output, int max_output)
+{
+    if (!llm_is_loaded()) {
+        kstrcpy(output, "[no model loaded]");
+        return -1;
+    }
+
+    llm_model_t *m = &llm_model;
+
+    /* Build chat prompt using the model's preferred format */
+    static char prompt_buf[2048];
+    int pos = 0;
+
+    /* Detect prompt format */
+    int is_chatml = 0;
+    if (kstrlen(m->arch) >= 4 &&
+        m->arch[0] == 'q' && m->arch[1] == 'w' &&
+        m->arch[2] == 'e' && m->arch[3] == 'n')
+        is_chatml = 1;
+
+    if (is_chatml) {
+        const char *s1 = "<|im_start|>system\nYou are a helpful AI assistant running on TensorOS, a bare-metal AI operating system.<|im_end|>\n<|im_start|>user\n";
+        kstrcpy(prompt_buf + pos, s1); pos += kstrlen(s1);
+        kstrcpy(prompt_buf + pos, user_text); pos += kstrlen(user_text);
+        const char *s2 = "<|im_end|>\n<|im_start|>assistant\n";
+        kstrcpy(prompt_buf + pos, s2); pos += kstrlen(s2);
+    } else if (kstrlen(m->arch) >= 5 &&
+               m->arch[0] == 'g' && m->arch[1] == 'e' &&
+               m->arch[2] == 'm' && m->arch[3] == 'm' && m->arch[4] == 'a') {
+        const char *s1 = "<start_of_turn>user\n";
+        kstrcpy(prompt_buf + pos, s1); pos += kstrlen(s1);
+        kstrcpy(prompt_buf + pos, user_text); pos += kstrlen(user_text);
+        const char *s2 = "<end_of_turn>\n<start_of_turn>model\n";
+        kstrcpy(prompt_buf + pos, s2); pos += kstrlen(s2);
+    } else {
+        /* Generic / LLaMA / SmolLM — simple prompt */
+        const char *s1 = "User: ";
+        kstrcpy(prompt_buf + pos, s1); pos += kstrlen(s1);
+        kstrcpy(prompt_buf + pos, user_text); pos += kstrlen(user_text);
+        const char *s2 = "\nAssistant: ";
+        kstrcpy(prompt_buf + pos, s2); pos += kstrlen(s2);
+    }
+    prompt_buf[pos] = '\0';
+
+    /* Tokenize */
+    int n_tokens = llm_tokenize(m, prompt_buf, llm_tokens, LLM_MAX_TOKENS - 64);
+    if (n_tokens <= 0) {
+        kstrcpy(output, "[tokenization failed]");
+        return -1;
+    }
+
+    /* Generate: max 256 tokens, temperature 0.7 with top-k/top-p sampling */
+    int n_gen = llm_generate(m, llm_tokens, n_tokens, output, max_output,
+                             256, 0.7f, 0);
+    return n_gen;
+}
+
+/* Reset KV cache for starting a new conversation */
+void llm_reset_cache(void)
+{
+    if (!llm_is_loaded()) return;
+    llm_model_t *m = &llm_model;
+    m->cache_len = 0;
+    int kv_total = m->n_layers * m->max_seq * m->n_kv_heads * m->head_dim;
+    if (kv_total > LLM_KV_FLOATS) kv_total = LLM_KV_FLOATS;
+    for (int i = 0; i < kv_total; i++) {
+        m->k_cache[i] = 0.0f;
+        m->v_cache[i] = 0.0f;
+    }
 }
