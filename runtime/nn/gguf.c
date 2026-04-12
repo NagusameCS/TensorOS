@@ -30,6 +30,7 @@ static const ggml_type_info_t type_info[] = {
     [GGML_TYPE_IQ3_XXS] = { "IQ3_XXS",256, 98 },
     [GGML_TYPE_IQ1_S]   = { "IQ1_S",  256, 50 },
     [GGML_TYPE_IQ4_NL]  = { "IQ4_NL", 32,  18 },
+    [GGML_TYPE_BF16]    = { "BF16",    1,   2 },
 };
 
 const ggml_type_info_t *ggml_get_type_info(ggml_type_t type)
@@ -365,6 +366,27 @@ int gguf_parse(gguf_ctx_t *ctx, const void *data, uint64_t size)
 
     ARCH_KEY("rope.freq_base", keybuf);
     ctx->rope_freq_base = gguf_get_f32(ctx, keybuf, 10000.0f);
+
+    ARCH_KEY("attention.key_length", keybuf);
+    ctx->n_embd_head_k = gguf_get_u32(ctx, keybuf, 0);
+
+    ARCH_KEY("attention.value_length", keybuf);
+    ctx->n_embd_head_v = gguf_get_u32(ctx, keybuf, 0);
+
+    ARCH_KEY("final_logit_softcapping", keybuf);
+    ctx->final_logit_softcap = gguf_get_f32(ctx, keybuf, 0.0f);
+
+    ARCH_KEY("attention.key_length_swa", keybuf);
+    ctx->n_embd_head_k_swa = gguf_get_u32(ctx, keybuf, 0);
+
+    ARCH_KEY("rope.freq_base_swa", keybuf);
+    ctx->rope_freq_base_swa = gguf_get_f32(ctx, keybuf, 0.0f);
+
+    ARCH_KEY("attention.shared_kv_layers", keybuf);
+    ctx->shared_kv_layers = gguf_get_u32(ctx, keybuf, 0);
+
+    ARCH_KEY("embedding_length_per_layer_input", keybuf);
+    ctx->n_embd_per_layer = gguf_get_u32(ctx, keybuf, 0);
 
     #undef ARCH_KEY
 

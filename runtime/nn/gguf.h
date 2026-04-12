@@ -54,6 +54,7 @@ typedef enum {
     GGML_TYPE_IQ3_XXS = 18,
     GGML_TYPE_IQ1_S   = 19,
     GGML_TYPE_IQ4_NL  = 20,
+    GGML_TYPE_BF16    = 30,
     GGML_TYPE_COUNT,
 } ggml_type_t;
 
@@ -142,6 +143,13 @@ typedef struct {
     uint32_t n_ff;              /* Feed-forward hidden size */
     float    rope_freq_base;
     float    rope_freq_scale;
+    uint32_t n_embd_head_k;     /* attention.key_length (0 = use n_embd/n_heads) */
+    uint32_t n_embd_head_v;     /* attention.value_length (0 = same as key_length) */
+    float    final_logit_softcap; /* final_logit_softcapping (0 = disabled) */
+    uint32_t n_embd_head_k_swa; /* attention.key_length_swa (0 = same as key_length) */
+    float    rope_freq_base_swa;/* rope.freq_base_swa (0 = same as rope_freq_base) */
+    uint32_t shared_kv_layers;  /* attention.shared_kv_layers (0 = none) */
+    uint32_t n_embd_per_layer;  /* embedding_length_per_layer (0 = no ISWA) */
 
     /* Total model size */
     uint64_t total_weight_bytes;

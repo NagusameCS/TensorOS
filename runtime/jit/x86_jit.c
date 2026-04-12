@@ -52,12 +52,18 @@ jit_buf_t *jit_create(int capacity)
         if (!jit_buf_active[i] && jit_buf_storage[i].cap >= capacity) {
             jit_buf_active[i] = true;
             jit_buf_storage[i].len = 0;
+            /* Ensure buffer is writable (may have been marked RX previously) */
+            vmm_mark_rw(jit_buf_storage[i].code, jit_buf_storage[i].cap);
             return &jit_buf_storage[i];
         }
     }
 
     if (jit_buf_count >= JIT_MAX_BUFS) return NULL;
     if (jit_pool_offset + capacity > JIT_POOL_SIZE) return NULL;
+
+    /* Ensure new region is writable (previous vmm_mark_rx may have made
+     * the enclosing page read-only / execute-only) */
+    vmm_mark_rw(jit_pool + jit_pool_offset, capacity);
 
     int idx = jit_buf_count++;
     jit_buf_t *b = &jit_buf_storage[idx];
@@ -705,13 +711,35 @@ void jit_prologue(jit_buf_t *b)
     jit_push(b, R13);
     jit_push(b, R14);
     jit_push(b, R15);
+#if defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
+    /* Windows x64 ABI: RSI and RDI are callee-saved (unlike System V).
+     * Save them before we remap args, restore in epilogue. */
+    jit_push(b, RSI);
+    jit_push(b, RDI);
+    /* 7 pushes + return addr = 8*8 = 64 → 16-aligned, but we have
+     * push rbp + push rbx + push r12-r15 + push rsi + push rdi = 8
+     * plus return addr = 9 * 8 = 72 → 8-mod-16. Need sub rsp,8 */
+    jit_sub_reg_imm32(b, RSP, 8);
+    /* Windows x64 ABI → System V ABI register mapping */
+    jit_mov_reg_reg(b, RDI, RCX);
+    jit_mov_reg_reg(b, RSI, RDX);
+    jit_mov_reg_reg(b, RDX, R8);
+    jit_mov_reg_reg(b, RCX, R9);
+#else
     /* Align stack to 16 bytes (5 pushes + return addr = 6*8 = 48, need 16-align) */
     jit_sub_reg_imm32(b, RSP, 8);
+#endif
 }
 
 void jit_epilogue(jit_buf_t *b)
 {
+#if defined(_WIN32) || defined(__MINGW32__) || defined(__MINGW64__)
     jit_add_reg_imm32(b, RSP, 8);
+    jit_pop(b, RDI);
+    jit_pop(b, RSI);
+#else
+    jit_add_reg_imm32(b, RSP, 8);
+#endif
     jit_pop(b, R15);
     jit_pop(b, R14);
     jit_pop(b, R13);

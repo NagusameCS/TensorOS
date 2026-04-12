@@ -57,6 +57,17 @@ static llm_model_t llm_model;
 /* Inference serialization: prevent concurrent use of static buffers */
 static volatile int llm_inference_active = 0;
 
+/* Streaming callback: called per-token during generation (NULL = disabled) */
+typedef void (*llm_token_cb_t)(const char *text, int len, void *userdata);
+static llm_token_cb_t llm_stream_cb   = (llm_token_cb_t)0;
+static void          *llm_stream_cb_ud = (void *)0;
+static llm_backend_t  llm_backend      = LLM_BACKEND_CPU;
+
+void llm_set_stream_cb(llm_token_cb_t cb, void *userdata) {
+    llm_stream_cb    = cb;
+    llm_stream_cb_ud = userdata;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  Dynamic scratch arena (allocated from tensor heap after model load)         */
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -78,6 +89,8 @@ static float *llm_attn_scores; /* [max_seq] attention scores */
 static float *llm_logits;      /* [vocab_size] output logits */
 static int   *llm_tokens;      /* [max_tokens] token buffer */
 static float *llm_rope_freqs_buf; /* [head_dim/2] precomputed RoPE */
+static float *llm_iswa_per_layer; /* [iswa_n_embd * n_layers] per-layer embeddings */
+static float *llm_iswa_tmp;       /* [iswa_n_embd] ISWA gating scratch */
 
 /* Sizes cached from the loaded model (for bounds checking) */
 static int llm_alloc_dim;
@@ -93,9 +106,15 @@ static int llm_alloc_scratch(const llm_model_t *m)
 {
     int dim      = m->dim;
     int ff       = m->ff_dim;
+    /* Find max ff_dim across all layers (Gemma4: layers 15+ have doubled FFN) */
+    for (int i = 0; i < m->n_layers; i++) {
+        if (m->layers[i].ff_dim_layer > ff) ff = m->layers[i].ff_dim_layer;
+    }
     int seq      = m->max_seq;
     int vocab    = m->vocab_size;
     int hd       = m->head_dim;
+    int q_dim    = m->n_heads * hd;     /* Q/attn output dimension (may differ from dim) */
+    int kv_dim   = m->n_kv_heads * hd;  /* K/V dimension per token */
     int kv_total = m->n_layers * seq * m->n_kv_heads * hd;
     int max_tok  = seq * 2;  /* generous token buffer */
 
@@ -103,12 +122,19 @@ static int llm_alloc_scratch(const llm_model_t *m)
     #define ALIGN64(x) (((x) + 63) & ~63ULL)
     uint64_t total = 0;
     total += ALIGN64((uint64_t)kv_total * sizeof(float)) * 2; /* k+v cache */
-    total += ALIGN64((uint64_t)dim * sizeof(float)) * 8;      /* x,xn,q,k,v,attn_out,ffn_d,head */
+    total += ALIGN64((uint64_t)dim * sizeof(float)) * 3;      /* x, xn, ffn_d */
+    total += ALIGN64((uint64_t)q_dim * sizeof(float)) * 2;    /* q, attn_out */
+    total += ALIGN64((uint64_t)kv_dim * sizeof(float)) * 2;   /* k_buf, v_buf */
+    total += ALIGN64((uint64_t)hd * sizeof(float));            /* head_buf */
     total += ALIGN64((uint64_t)ff * sizeof(float)) * 2;       /* ffn_g, ffn_u */
     total += ALIGN64((uint64_t)seq * sizeof(float));           /* attn_scores */
     total += ALIGN64((uint64_t)vocab * sizeof(float));         /* logits */
     total += ALIGN64((uint64_t)max_tok * sizeof(int));         /* tokens */
     total += ALIGN64((uint64_t)(hd / 2) * sizeof(float));     /* rope freqs */
+    /* ISWA scratch */
+    int iswa_n_ = m->iswa_n_embd > 0 ? m->iswa_n_embd : 1;
+    total += ALIGN64((uint64_t)(iswa_n_ * m->n_layers) * sizeof(float)); /* per_layer */
+    total += ALIGN64((uint64_t)iswa_n_ * sizeof(float));                  /* tmp */
 
     kprintf("[LLM] Allocating %lu MB scratch arena\n",
             (unsigned long)(total / (1024 * 1024)));
@@ -131,18 +157,23 @@ static int llm_alloc_scratch(const llm_model_t *m)
     ARENA_NEXT(llm_kv_v,        float, kv_total);
     ARENA_NEXT(llm_x,           float, dim);
     ARENA_NEXT(llm_xn,          float, dim);
-    ARENA_NEXT(llm_q,           float, dim);
-    ARENA_NEXT(llm_k_buf,       float, dim);
-    ARENA_NEXT(llm_v_buf,       float, dim);
-    ARENA_NEXT(llm_attn_out,    float, dim);
+    ARENA_NEXT(llm_q,           float, q_dim);
+    ARENA_NEXT(llm_k_buf,       float, kv_dim);
+    ARENA_NEXT(llm_v_buf,       float, kv_dim);
+    ARENA_NEXT(llm_attn_out,    float, q_dim);
     ARENA_NEXT(llm_ffn_g,       float, ff);
     ARENA_NEXT(llm_ffn_u,       float, ff);
     ARENA_NEXT(llm_ffn_d,       float, dim);
-    ARENA_NEXT(llm_head_buf,    float, dim);
+    ARENA_NEXT(llm_head_buf,    float, hd);
     ARENA_NEXT(llm_attn_scores, float, seq);
     ARENA_NEXT(llm_logits,      float, vocab);
     ARENA_NEXT(llm_tokens,      int,   max_tok);
     ARENA_NEXT(llm_rope_freqs_buf, float, hd / 2);
+    /* ISWA scratch (Gemma4) */
+    int iswa_n = m->iswa_n_embd > 0 ? m->iswa_n_embd : 1;
+    int iswa_total = iswa_n * m->n_layers;
+    ARENA_NEXT(llm_iswa_per_layer, float, iswa_total);
+    ARENA_NEXT(llm_iswa_tmp,       float, iswa_n);
 
     #undef ARENA_NEXT
     #undef ALIGN64
@@ -192,6 +223,15 @@ static float fp16_to_fp32(uint16_t h)
 
     exp = exp + 127 - 15;
     uint32_t bits = sign | (exp << 23) | (mant << 13);
+    float f;
+    kmemcpy(&f, &bits, 4);
+    return f;
+}
+
+/* BF16 to FP32: just shift left by 16 (BF16 is upper 16 bits of FP32) */
+static float bf16_to_fp32(uint16_t h)
+{
+    uint32_t bits = (uint32_t)h << 16;
     float f;
     kmemcpy(&f, &bits, 4);
     return f;
@@ -551,6 +591,12 @@ static float llm_vec_dot(const void *weight, const float *x, int n, ggml_type_t 
             sum += q6_k_dot256(&blocks[b], x + b * 256);
         break;
     }
+    case GGML_TYPE_BF16: {
+        const uint16_t *bf = (const uint16_t *)weight;
+        for (int i = 0; i < n; i++)
+            sum += bf16_to_fp32(bf[i]) * x[i];
+        break;
+    }
     default:
         break;
     }
@@ -591,8 +637,8 @@ static inline v8f v8f_max(v8f a, v8f b) {
 /* AVX2 vectorized exp: range reduction exp(x)=2^n * exp(r), minimax poly */
 __attribute__((target("avx2,fma")))
 static inline v8f v8f_expf(v8f x) {
-    x = v8f_max(x, v8f_set1(-88.7f));
-    x = v8f_min(x, v8f_set1(88.7f));
+    x = v8f_max(x, v8f_set1(-86.0f));
+    x = v8f_min(x, v8f_set1(86.0f));
     /* n = round(x / ln2) */
     v8f nf;
     __asm__("vroundps $0, %1, %0" : "=x"(nf) : "x"(x * v8f_set1(1.4426950408f)));
@@ -643,7 +689,7 @@ static inline float fp16_to_fp32_fast(uint16_t h)
 /* ─── Integer Q8×Q8 dot product (avoids ALL int→float conversion) ─── */
 
 /* Temporary quantized input block (float scale, not fp16, for speed) */
-typedef struct { float d; int8_t qs[32]; } q8_input_t;
+typedef struct { float d; int32_t isum; int8_t qs[32]; } q8_input_t;
 
 /* Pre-quantized input buffer — max 512 blocks = 16384 elements (covers 9216-dim FFN) */
 #define Q8_MAX_BLOCKS 512
@@ -669,6 +715,7 @@ static void q8_quantize_block(q8_input_t *out, const float *x)
 
     if (amax < 1e-30f) {
         out->d = 0.0f;
+        out->isum = 0;
         __builtin_memset(out->qs, 0, 32);
         return;
     }
@@ -692,6 +739,12 @@ static void q8_quantize_block(q8_input_t *out, const float *x)
             if (q < -127) q = -127;
             out->qs[i + j] = (int8_t)q;
         }
+    }
+    /* Cache sum of quantized values for Q4×Q8 bias correction */
+    {
+        int32_t s = 0;
+        for (int j = 0; j < 32; j++) s += out->qs[j];
+        out->isum = s;
     }
 }
 
@@ -1074,41 +1127,34 @@ typedef char  v32b __attribute__((vector_size(32)));
 __attribute__((target("avx2,fma")))
 static inline float q4_0_q8_dot_avx2(const ggml_q4_0_t *w, const q8_input_t *xq)
 {
-    /* Unpack 16 Q4_0 bytes → 32 unsigned nibbles [0..15] in GGML layout:
-     * positions 0..15 = lo nibbles, positions 16..31 = hi nibbles */
+    /* Scalar nibble unpack: 16 iterations, well-predicted by OOO hardware.
+     * Main improvement over old path: avoids the 32-iteration scalar xsum loop
+     * by using the precomputed xq->isum from q8_quantize_block. */
     uint8_t q4u[32];
     for (int j = 0; j < 16; j++) {
         q4u[j]      = w->qs[j] & 0x0F;
         q4u[j + 16] = w->qs[j] >> 4;
     }
 
-    /* Load into SIMD vectors */
-    v32b q4_unsigned;
-    __builtin_memcpy(&q4_unsigned, q4u, 32);
-    v32b xq_bytes;
-    __builtin_memcpy(&xq_bytes, xq->qs, 32);
+    v32b q4_unsigned; __builtin_memcpy(&q4_unsigned, q4u, 32);
+    v32b xq_bytes;    __builtin_memcpy(&xq_bytes,    xq->qs, 32);
 
-    /* vpmaddubsw: unsigned Q4 × signed Q8 → 16 × int16 */
+    /* vpmaddubsw: unsigned Q4 [0,15] × signed Q8 → 16 × int16 */
     v16s prod16;
     __asm__("vpmaddubsw %2, %1, %0" : "=x"(prod16) : "x"(q4_unsigned), "x"(xq_bytes));
 
-    /* vpmaddwd: adjacent int16 pairs → 8 × int32 */
-    v16s ones = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
+    /* vpmaddwd with ones → 8 × int32 */
+    const v16s ones = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
     v8i sum32;
     __asm__("vpmaddwd %2, %1, %0" : "=x"(sum32) : "x"(prod16), "x"(ones));
 
     /* Horizontal sum of 8 int32s */
     union { v8i vec; int i[8]; } su = { .vec = sum32 };
-    int isum = (su.i[0]+su.i[1]+su.i[2]+su.i[3]) + (su.i[4]+su.i[5]+su.i[6]+su.i[7]);
+    int dot = (su.i[0]+su.i[1]+su.i[2]+su.i[3]) + (su.i[4]+su.i[5]+su.i[6]+su.i[7]);
 
-    /* Correction: Q4 values are unsigned [0,15] but should be signed [-8,7].
-     * The dot product includes an extra: sum_i(8 * xq[i]).
-     * Subtract: bias = 8 * sum(xq[0..31]) */
-    int xsum = 0;
-    for (int j = 0; j < 32; j++) xsum += xq->qs[j];
-
+    /* Bias correction using cached isum — avoids the old 32-scalar-op xsum loop */
     float wd = fp16_to_fp32_fast(w->d);
-    return wd * xq->d * (float)(isum - 8 * xsum);
+    return wd * xq->d * (float)(dot - 8 * xq->isum);
 }
 
 /* Fused Q4_0×Q8_0 integer GEMV: 4 rows at a time with shared Q8 input */
@@ -1199,24 +1245,38 @@ static void llm_gemv_q4_q8_fused_range_avx2(float *out, const void *weight,
 }
 
 /* ─── Q4_0 nibble unpacking helpers for standard GGML layout ─── */
-/* Extract 8 lo nibbles from 8 consecutive bytes → 8 floats (elements j..j+7) */
+/* Extract 8 lo nibbles from 8 consecutive bytes → 8 floats.
+ * Uses VPMOVZXBD (8-byte load → 8×int32) + AND + SUB + VCVTDQ2PS (1 cycle each). */
 __attribute__((target("avx2,fma")))
 static inline v8f q4_unpack_lo_v8f(const uint8_t *qs)
 {
-    return (v8f){(float)((int)(qs[0]&0xF)-8), (float)((int)(qs[1]&0xF)-8),
-                 (float)((int)(qs[2]&0xF)-8), (float)((int)(qs[3]&0xF)-8),
-                 (float)((int)(qs[4]&0xF)-8), (float)((int)(qs[5]&0xF)-8),
-                 (float)((int)(qs[6]&0xF)-8), (float)((int)(qs[7]&0xF)-8)};
+    typedef unsigned char v16ub __attribute__((vector_size(16)));
+    typedef int v8i __attribute__((vector_size(32)));
+    v16ub tmp = {0}; __builtin_memcpy(&tmp, qs, 8);
+    v8i i32; __asm__("vpmovzxbd %1, %0" : "=x"(i32) : "x"(tmp));
+    v8i mask = (v8i){0xF,0xF,0xF,0xF,0xF,0xF,0xF,0xF};
+    v8i bias = (v8i){8,8,8,8,8,8,8,8};
+    v8i signed_n = (i32 & mask) - bias;
+    v8f result; __asm__("vcvtdq2ps %1, %0" : "=x"(result) : "x"(signed_n));
+    return result;
 }
 
-/* Extract 8 hi nibbles from 8 consecutive bytes → 8 floats (elements j+16..j+23) */
+/* Extract 8 hi nibbles from 8 consecutive bytes → 8 floats. */
 __attribute__((target("avx2,fma")))
 static inline v8f q4_unpack_hi_v8f(const uint8_t *qs)
 {
-    return (v8f){(float)((int)(qs[0]>>4)-8), (float)((int)(qs[1]>>4)-8),
-                 (float)((int)(qs[2]>>4)-8), (float)((int)(qs[3]>>4)-8),
-                 (float)((int)(qs[4]>>4)-8), (float)((int)(qs[5]>>4)-8),
-                 (float)((int)(qs[6]>>4)-8), (float)((int)(qs[7]>>4)-8)};
+    typedef unsigned char v16ub __attribute__((vector_size(16)));
+    typedef int v8i __attribute__((vector_size(32)));
+    v16ub tmp = {0}; __builtin_memcpy(&tmp, qs, 8);
+    v8i i32; __asm__("vpmovzxbd %1, %0" : "=x"(i32) : "x"(tmp));
+    v8i mask = (v8i){0xF,0xF,0xF,0xF,0xF,0xF,0xF,0xF};
+    v8i bias = (v8i){8,8,8,8,8,8,8,8};
+    v8i shifted;
+    /* VPSRLD $4: logical right shift each int32 element by 4 bits */
+    __asm__("vpsrld $4, %1, %0" : "=x"(shifted) : "x"(i32));
+    v8i signed_n = (shifted & mask) - bias;
+    v8f result; __asm__("vcvtdq2ps %1, %0" : "=x"(result) : "x"(signed_n));
+    return result;
 }
 
 /* ─── Fused Q4_0 GEMV: 4-row batched with shared x loads ───
@@ -1487,6 +1547,7 @@ static uint64_t llm_row_bytes(int in_dim, ggml_type_t type)
     case GGML_TYPE_Q8_0: return (uint64_t)(in_dim / 32) * 34;
     case GGML_TYPE_Q6_K: return (uint64_t)(in_dim / 256) * 210;
     case GGML_TYPE_F16:  return (uint64_t)in_dim * 2;
+    case GGML_TYPE_BF16: return (uint64_t)in_dim * 2;
     case GGML_TYPE_F32:  return (uint64_t)in_dim * 4;
     default:             return (uint64_t)in_dim * 4;
     }
@@ -1622,7 +1683,7 @@ static void llm_gemv(float *out, const void *weight, const float *x,
         }
     }
 
-    /* JIT AVX2 Q4_0×Q8_0 integer GEMV: DISABLED — debugging correctness */
+    /* Q4×Q8 integer path disabled — JIT path only (non-JIT uses parallel below) */
     if (0 && cpu_features.avx2_usable && type == GGML_TYPE_Q4_0) {
         int nb = in_dim / 32;
         if (nb <= Q8_MAX_BLOCKS) {
@@ -1650,7 +1711,7 @@ static void llm_gemv(float *out, const void *weight, const float *x,
             int bsp_end   = bsp_chunk;
             row = bsp_end;
 
-            /* Q4×Q8 integer path disabled — correctness under investigation */
+            /* Q4×Q8 integer path pending correctness fix — use float path */
             const q8_input_t *xq_ptr = (void *)0;
 
             /* Dispatch to APs (cpu 1..ncpu-1) */
@@ -1719,6 +1780,8 @@ static float llm_get_f(const void *data, int idx, ggml_type_t type)
         return ((const float *)data)[idx];
     case GGML_TYPE_F16:
         return fp16_to_fp32(((const uint16_t *)data)[idx]);
+    case GGML_TYPE_BF16:
+        return bf16_to_fp32(((const uint16_t *)data)[idx]);
     default:
         return 0.0f;
     }
@@ -1766,9 +1829,45 @@ static void llm_embed(float *out, const llm_model_t *m, int token_id)
         }
         break;
     }
+    case GGML_TYPE_Q6_K: {
+        /* Q6_K: 256 elements per super-block, 210 bytes each */
+        const ggml_q6_k_t *blocks = (const ggml_q6_k_t *)row;
+        int nsb = dim / 256;
+        for (int sb = 0; sb < nsb; sb++) {
+            const ggml_q6_k_t *b = &blocks[sb];
+            float d = fp16_to_fp32(b->d);
+            const uint8_t *ql = b->ql;
+            const uint8_t *qh = b->qh;
+            const int8_t *sc = b->scales;
+            float *o = out + sb * 256;
+            for (int half = 0; half < 2; half++) {
+                const uint8_t *ql_h = ql + half * 64;
+                const uint8_t *qh_h = qh + half * 32;
+                const int8_t *sc_h = sc + half * 8;
+                for (int l = 0; l < 32; l++) {
+                    int q0 = (int)(ql_h[l] & 0xF)      | (int)(((qh_h[l] >> 0) & 3) << 4);
+                    int q1 = (int)(ql_h[l + 32] & 0xF)  | (int)(((qh_h[l] >> 2) & 3) << 4);
+                    int q2 = (int)(ql_h[l] >> 4)         | (int)(((qh_h[l] >> 4) & 3) << 4);
+                    int q3 = (int)(ql_h[l + 32] >> 4)    | (int)(((qh_h[l] >> 6) & 3) << 4);
+                    int si = l / 16;
+                    o[half*128 + l]      = d * (float)sc_h[0 + si] * (float)(q0 - 32);
+                    o[half*128 + l + 32] = d * (float)sc_h[2 + si] * (float)(q1 - 32);
+                    o[half*128 + l + 64] = d * (float)sc_h[4 + si] * (float)(q2 - 32);
+                    o[half*128 + l + 96] = d * (float)sc_h[6 + si] * (float)(q3 - 32);
+                }
+            }
+        }
+        break;
+    }
     default:
         for (int i = 0; i < dim; i++) out[i] = 0.0f;
         break;
+    }
+
+    /* Gemma models scale embeddings by sqrt(dim) */
+    if (m->embed_scale != 1.0f) {
+        float s = m->embed_scale;
+        for (int i = 0; i < dim; i++) out[i] *= s;
     }
 }
 
@@ -2395,13 +2494,6 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
         jit_fwd_rope_hd    = jit_compile_rope_kernel(hd);
         jit_fwd_rmsnorm    = jit_compile_rmsnorm_kernel(dim);
         jit_fwd_softmax    = NULL; /* softmax has variable length (seq_len) — skip */
-        if (jit_fwd_vadd_dim)  kprintf("[JIT] Compiled vadd(%d)\n", dim);
-        if (jit_fwd_dot_hd)    kprintf("[JIT] Compiled dot(%d)\n", hd);
-        if (jit_fwd_axpy_hd)   kprintf("[JIT] Compiled axpy(%d)\n", hd);
-        if (jit_fwd_fused_silu) kprintf("[JIT] Compiled fused_silu_mul(%d)\n", ff);
-        if (jit_fwd_rope_hd)   kprintf("[JIT] Compiled rope(%d)\n", hd);
-        if (jit_fwd_rmsnorm)   kprintf("[JIT] Compiled rmsnorm(%d)\n", dim);
-        kprintf("[JIT] %d CPUs for parallel GEMV\n", smp.cpu_count);
         jit_fwd_ready = 1;
     }
 #endif
@@ -2409,49 +2501,83 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
     /* 1. Embedding lookup */
     llm_embed(llm_x, m, token_id);
 
-    /* Debug: check embedding output (disabled for performance) */
-    static int fwd_dbg_count = 99;
-    if (fwd_dbg_count == 0) {
-        float emin = llm_x[0], emax = llm_x[0], esum = 0.0f;
-        int ezero = 0;
-        for (int i = 0; i < dim; i++) {
-            if (llm_x[i] < emin) emin = llm_x[i];
-            if (llm_x[i] > emax) emax = llm_x[i];
-            esum += llm_x[i] > 0 ? llm_x[i] : -llm_x[i];
-            if (llm_x[i] == 0.0f) ezero++;
-        }
-        kprintf("[DBG] embed tok=%d: min=%.4f max=%.4f abssum=%.2f zeros=%d/%d\n",
-                token_id, (double)emin, (double)emax, (double)esum, ezero, dim);
-        kprintf("[DBG] embed[0..3]=%.6f %.6f %.6f %.6f\n",
-                (double)llm_x[0], (double)llm_x[1], (double)llm_x[2], (double)llm_x[3]);
-    }
-
     /* 2. Process each transformer layer */
     int rope_dim = m->rope_dim > 0 ? m->rope_dim : hd; /* partial RoPE for Phi-2 */
 
-    /* Debug: print layer 0 weight types on first forward */
-    if (fwd_dbg_count == 0) {
-        llm_layer_t *l0 = &m->layers[0];
-        kprintf("[DBG] L0 types: q=%d k=%d v=%d o=%d gate=%d up=%d down=%d norm=%d ffn_norm=%d\n",
-                l0->q_type, l0->k_type, l0->v_type, l0->o_type,
-                l0->gate_type, l0->up_type, l0->down_type,
-                l0->attn_norm_type, l0->ffn_norm_type);
-        kprintf("[DBG] gelu=%d layernorm=%d ffn_gate=%p rope_dim=%d rope_base=%.1f\n",
-                m->use_gelu, m->use_layernorm, (void*)l0->ffn_gate,
-                rope_dim, (double)m->rope_base);
-        /* Check if any layer has an unsupported type */
-        for (int L = 0; L < m->n_layers; L++) {
-            llm_layer_t *lt = &m->layers[L];
-            int types[] = {lt->q_type, lt->k_type, lt->v_type, lt->o_type,
-                           lt->gate_type, lt->up_type, lt->down_type};
-            for (int t = 0; t < 7; t++) {
-                if (types[t] != GGML_TYPE_Q4_0 && types[t] != GGML_TYPE_Q4_1 &&
-                    types[t] != GGML_TYPE_Q8_0 && types[t] != GGML_TYPE_Q6_K &&
-                    types[t] != GGML_TYPE_F16 && types[t] != GGML_TYPE_F32) {
-                    kprintf("[DBG] WARNING: L%d weight[%d] has unsupported type=%d\n", L, t, types[t]);
+    /* === Gemma4 ISWA: precompute per-layer embeddings === */
+    if (m->is_gemma4 && m->iswa_tok_embd && m->iswa_model_proj) {
+        int iswa_d = m->iswa_n_embd;   /* 256 */
+        int iswa_total = iswa_d * m->n_layers; /* 8960 */
+        float inv_sqrt_dim = 1.0f / llm_sqrtf((float)dim);
+        float sqrt_iswa_d  = llm_sqrtf((float)iswa_d);
+        float inv_sqrt_2   = 1.0f / llm_sqrtf(2.0f);
+
+        /* Step 1: token embedding lookup from per_layer_token_embd → [8960] */
+        uint64_t emb_rb = llm_row_bytes(iswa_total, m->iswa_tok_embd_type);
+        const uint8_t *emb_row = (const uint8_t *)m->iswa_tok_embd
+                                 + (uint64_t)token_id * emb_rb;
+        /* Dequant Q6_K row into llm_iswa_per_layer */
+        if (m->iswa_tok_embd_type == GGML_TYPE_Q6_K) {
+            const ggml_q6_k_t *blocks = (const ggml_q6_k_t *)emb_row;
+            int nsb = iswa_total / 256;
+            for (int sb = 0; sb < nsb; sb++) {
+                const ggml_q6_k_t *b = &blocks[sb];
+                float d_val = fp16_to_fp32(b->d);
+                const uint8_t *ql = b->ql;
+                const uint8_t *qh = b->qh;
+                const int8_t *sc = b->scales;
+                float *o = llm_iswa_per_layer + sb * 256;
+                for (int half = 0; half < 2; half++) {
+                    const uint8_t *ql_h = ql + half * 64;
+                    const uint8_t *qh_h = qh + half * 32;
+                    const int8_t *sc_h = sc + half * 8;
+                    for (int l = 0; l < 32; l++) {
+                        int q0 = (int)(ql_h[l] & 0xF)      | (int)(((qh_h[l] >> 0) & 3) << 4);
+                        int q1 = (int)(ql_h[l + 32] & 0xF)  | (int)(((qh_h[l] >> 2) & 3) << 4);
+                        int q2 = (int)(ql_h[l] >> 4)         | (int)(((qh_h[l] >> 4) & 3) << 4);
+                        int q3 = (int)(ql_h[l + 32] >> 4)    | (int)(((qh_h[l] >> 6) & 3) << 4);
+                        int si = l / 16;
+                        o[half*128 + l]      = d_val * (float)sc_h[0 + si] * (float)(q0 - 32);
+                        o[half*128 + l + 32] = d_val * (float)sc_h[2 + si] * (float)(q1 - 32);
+                        o[half*128 + l + 64] = d_val * (float)sc_h[4 + si] * (float)(q2 - 32);
+                        o[half*128 + l + 96] = d_val * (float)sc_h[6 + si] * (float)(q3 - 32);
+                    }
                 }
             }
+        } else {
+            /* F32/F16/BF16 fallback */
+            for (int i = 0; i < iswa_total; i++)
+                llm_iswa_per_layer[i] = llm_get_f(m->iswa_tok_embd, i, m->iswa_tok_embd_type);
         }
+        /* Scale by sqrt(iswa_d) */
+        for (int i = 0; i < iswa_total; i++)
+            llm_iswa_per_layer[i] *= sqrt_iswa_d;
+
+        /* Step 2: project model input to per-layer space */
+        /* per_layer_proj[8960] = per_layer_model_proj[1536, 8960] · inpL[1536] */
+        /* We use llm_iswa_tmp as temp for the projection (need 8960 floats — reuse ffn_g) */
+        float *proj_buf = llm_ffn_g; /* reuse FFN scratch (size >= 12288 > 8960) */
+        llm_gemv(proj_buf, m->iswa_model_proj, llm_x, iswa_total, dim,
+                 m->iswa_model_proj_type);
+        /* Scale by 1/sqrt(dim) */
+        for (int i = 0; i < iswa_total; i++)
+            proj_buf[i] *= inv_sqrt_dim;
+
+        /* Step 3: RMSNorm each [iswa_d] slice with per_layer_proj_norm */
+        if (m->iswa_proj_norm) {
+            const float *norm_w = (const float *)m->iswa_proj_norm;
+            for (int l = 0; l < m->n_layers; l++) {
+                float *sl = proj_buf + l * iswa_d;
+                float ss = 0.0f;
+                for (int i = 0; i < iswa_d; i++) ss += sl[i] * sl[i];
+                float rms = 1.0f / llm_sqrtf(ss / (float)iswa_d + m->rms_eps);
+                for (int i = 0; i < iswa_d; i++) sl[i] = sl[i] * rms * norm_w[i];
+            }
+        }
+
+        /* Step 4: Add token embedding + projection, scale by 1/sqrt(2) */
+        for (int i = 0; i < iswa_total; i++)
+            llm_iswa_per_layer[i] = (llm_iswa_per_layer[i] + proj_buf[i]) * inv_sqrt_2;
     }
 
     for (int L = 0; L < m->n_layers; L++) {
@@ -2466,193 +2592,166 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
         else
             llm_rmsnorm(llm_xn, llm_x, layer->attn_norm, dim, layer->attn_norm_type, m->rms_eps);
 
-        /* 2b. Q/K/V projections */
-        llm_gemv(llm_q,     layer->q_weight, llm_xn, n_heads * hd, dim, layer->q_type);
-        llm_gemv(llm_k_buf, layer->k_weight, llm_xn, kv_dim,       dim, layer->k_type);
-        llm_gemv(llm_v_buf, layer->v_weight, llm_xn, kv_dim,       dim, layer->v_type);
+        /* Per-layer head_dim for Gemma4 (SWA=256, full=512) */
+        int lhd = layer->head_dim_layer ? layer->head_dim_layer : hd;
+        int lkv_dim = n_kv * lhd;
+        int lq_dim = n_heads * lhd;
 
-        /* Diagnostic: verify GEMV against explicit scalar dequant for L0 first token */
-        if (L == 0 && fwd_dbg_count == 0) {
-            /* Manually compute Q[0] = dot(Q_weight_row0, xn) using explicit dequant */
-            const ggml_q4_0_t *qblocks = (const ggml_q4_0_t *)layer->q_weight;
-            int nb = dim / 32;
-            float manual_q0 = 0.0f;
-            for (int b = 0; b < nb; b++) {
-                float d_val = fp16_to_fp32(qblocks[b].d);
-                const uint8_t *qs = qblocks[b].qs;
-                for (int j = 0; j < 16; j++) {
-                    float lo = (float)((int)(qs[j] & 0xF) - 8);
-                    float hi = (float)((int)(qs[j] >> 4) - 8);
-                    manual_q0 += d_val * lo * llm_xn[b * 32 + j];
-                    manual_q0 += d_val * hi * llm_xn[b * 32 + j + 16];
-                }
-            }
-            kprintf("[DBG] L0 Q[0] verify: gemv=%.6f manual=%.6f diff=%.6f\n",
-                    (double)llm_q[0], (double)manual_q0, (double)(llm_q[0] - manual_q0));
-            kprintf("[DBG] L0 Q stats: min=%.4f max=%.4f [0..3]=%.4f,%.4f,%.4f,%.4f\n",
-                    (double)llm_q[0], (double)llm_q[1],
-                    (double)llm_q[0], (double)llm_q[1], (double)llm_q[2], (double)llm_q[3]);
-            kprintf("[DBG] L0 K stats: [0..3]=%.4f,%.4f,%.4f,%.4f\n",
-                    (double)llm_k_buf[0], (double)llm_k_buf[1], (double)llm_k_buf[2], (double)llm_k_buf[3]);
-            kprintf("[DBG] L0 V stats: [0..3]=%.4f,%.4f,%.4f,%.4f\n",
-                    (double)llm_v_buf[0], (double)llm_v_buf[1], (double)llm_v_buf[2], (double)llm_v_buf[3]);
+        /* 2b. Q projection (always computed) */
+        llm_gemv(llm_q,     layer->q_weight, llm_xn, lq_dim, dim, layer->q_type);
 
-            /* Check L2 norm of Q, K, V to see if projections have reasonable magnitude */
-            float q_l2 = 0.0f, k_l2 = 0.0f, v_l2 = 0.0f;
-            for (int i = 0; i < dim; i++) {
-                q_l2 += llm_q[i] * llm_q[i];
-                k_l2 += llm_k_buf[i] * llm_k_buf[i];
-                v_l2 += llm_v_buf[i] * llm_v_buf[i];
-            }
-            kprintf("[DBG] L0 Q_L2=%.4f K_L2=%.4f V_L2=%.4f (expect ~dim=3072 for well-scaled)\n",
-                    (double)q_l2, (double)k_l2, (double)v_l2);
-
-            /* Also check input norm (xn should be ~O(1) per element after RMSNorm) */
-            float xn_l2 = 0.0f, xn_absmax = 0.0f;
-            for (int i = 0; i < dim; i++) {
-                xn_l2 += llm_xn[i] * llm_xn[i];
-                float a = llm_xn[i] > 0 ? llm_xn[i] : -llm_xn[i];
-                if (a > xn_absmax) xn_absmax = a;
-            }
-            kprintf("[DBG] L0 xn_L2=%.4f xn_absmax=%.4f\n", (double)xn_l2, (double)xn_absmax);
-
-            /* Check weight scale magnitudes: first 4 Q4_0 blocks of Q weight */
-            kprintf("[DBG] L0 Q_wt scales: d[0..3]=%.6f,%.6f,%.6f,%.6f\n",
-                    (double)fp16_to_fp32(qblocks[0].d),
-                    (double)fp16_to_fp32(qblocks[1].d),
-                    (double)fp16_to_fp32(qblocks[2].d),
-                    (double)fp16_to_fp32(qblocks[3].d));
-
-            /* Check norm weights */
-            const float *nw = (const float *)layer->attn_norm;
-            float nw_min = nw[0], nw_max = nw[0], nw_sum = 0.0f;
-            for (int i = 0; i < dim; i++) {
-                if (nw[i] < nw_min) nw_min = nw[i];
-                if (nw[i] > nw_max) nw_max = nw[i];
-                nw_sum += nw[i] > 0 ? nw[i] : -nw[i];
-            }
-            kprintf("[DBG] L0 attn_norm wt: min=%.4f max=%.4f avg_abs=%.4f [0..3]=%.4f,%.4f,%.4f,%.4f\n",
-                    (double)nw_min, (double)nw_max, (double)(nw_sum/dim),
-                    (double)nw[0], (double)nw[1], (double)nw[2], (double)nw[3]);
-            /* Print raw bytes of first 4 norm weight values */
-            const uint8_t *nwb = (const uint8_t *)nw;
-            kprintf("[DBG] L0 norm raw: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x\n",
-                    nwb[0],nwb[1],nwb[2],nwb[3],nwb[4],nwb[5],nwb[6],nwb[7],
-                    nwb[8],nwb[9],nwb[10],nwb[11],nwb[12],nwb[13],nwb[14],nwb[15]);
-            kprintf("\n");
-            /* If these were F16, what would the first values be? */
-            const uint16_t *nw16 = (const uint16_t *)layer->attn_norm;
-            kprintf("[DBG] L0 norm as F16: [0..7]=%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-                    (double)fp16_to_fp32(nw16[0]), (double)fp16_to_fp32(nw16[1]),
-                    (double)fp16_to_fp32(nw16[2]), (double)fp16_to_fp32(nw16[3]),
-                    (double)fp16_to_fp32(nw16[4]), (double)fp16_to_fp32(nw16[5]),
-                    (double)fp16_to_fp32(nw16[6]), (double)fp16_to_fp32(nw16[7]));
-
-            /* Check raw embedding L2 norm */
-            float embed_l2 = 0.0f;
-            for (int i = 0; i < dim; i++) embed_l2 += llm_x[i] * llm_x[i];
-            kprintf("[DBG] L0 embed_L2=%.4f (raw, before norm). RMSnorm divisor=%.6f\n",
-                    (double)embed_l2, (double)llm_sqrtf(embed_l2 / (float)dim + m->rms_eps));
+        /* K/V projection: skip if reusing another layer's KV cache */
+        int has_own_kv = (layer->kv_reuse_layer < 0);
+        if (has_own_kv) {
+            llm_gemv(llm_k_buf, layer->k_weight, llm_xn, lkv_dim, dim, layer->k_type);
+            llm_gemv(llm_v_buf, layer->v_weight, llm_xn, lkv_dim, dim, layer->v_type);
         }
 
         /* Add bias if present (Phi-2) */
-        llm_add_bias(llm_q,     layer->q_bias, n_heads * hd);
-        llm_add_bias(llm_k_buf, layer->k_bias, kv_dim);
-        llm_add_bias(llm_v_buf, layer->v_bias, kv_dim);
+        llm_add_bias(llm_q,     layer->q_bias, lq_dim);
+        if (has_own_kv) {
+            llm_add_bias(llm_k_buf, layer->k_bias, lkv_dim);
+            llm_add_bias(llm_v_buf, layer->v_bias, lkv_dim);
+        }
 
-        /* 2c. Apply RoPE to Q and K (partial RoPE for Phi-2: only first rope_dim dims) */
+        /* Gemma4: per-head Q/K normalization */
+        if (layer->q_norm) {
+            const float *qnw = (const float *)layer->q_norm;
+            for (int h = 0; h < n_heads; h++) {
+                float *qh = llm_q + h * lhd;
+                /* RMSNorm per-head: norm then scale by weights */
+                float ss = 0.0f;
+                for (int i = 0; i < lhd; i++) ss += qh[i] * qh[i];
+                float rms = 1.0f / llm_sqrtf(ss / (float)lhd + m->rms_eps);
+                for (int i = 0; i < lhd; i++) qh[i] = qh[i] * rms * qnw[i];
+            }
+        }
+        if (layer->k_norm && has_own_kv) {
+            const float *knw = (const float *)layer->k_norm;
+            for (int h = 0; h < n_kv; h++) {
+                float *kh = llm_k_buf + h * lhd;
+                float ss = 0.0f;
+                for (int i = 0; i < lhd; i++) ss += kh[i] * kh[i];
+                float rms = 1.0f / llm_sqrtf(ss / (float)lhd + m->rms_eps);
+                for (int i = 0; i < lhd; i++) kh[i] = kh[i] * rms * knw[i];
+            }
+            /* V bare RMSNorm: normalize per-head without learned weights */
+            for (int h = 0; h < n_kv; h++) {
+                float *vh = llm_v_buf + h * lhd;
+                float ss = 0.0f;
+                for (int i = 0; i < lhd; i++) ss += vh[i] * vh[i];
+                float rms = 1.0f / llm_sqrtf(ss / (float)lhd + m->rms_eps);
+                for (int i = 0; i < lhd; i++) vh[i] *= rms;
+            }
+        }
+
+        /* 2c. Apply RoPE to Q and K */
+        /* Gemma4: different RoPE base for SWA vs full attention layers */
+        float layer_rope_base = m->rope_base;
+        int   layer_rope_dim  = lhd; /* Gemma4 uses full head_dim for RoPE */
+        if (m->is_gemma4 && lhd == m->head_dim_swa)
+            layer_rope_base = m->rope_base_swa;
+
         /* Select longrope factors: short if pos < orig_ctx, long otherwise */
         const float *rope_f = (const float *)0;
         if (m->rope_factors_short || m->rope_factors_long) {
             rope_f = (pos < m->rope_orig_ctx) ? m->rope_factors_short : m->rope_factors_long;
         }
-        if (jit_fwd_rope_hd && rope_dim == hd) {
-            llm_rope_precompute(m->rope_base, hd, rope_f);
+        /* Gemma4: full-attention layers use precomputed rope_freqs as factors */
+        if (m->is_gemma4 && m->rope_freqs && lhd != m->head_dim_swa) {
+            rope_f = m->rope_freqs;
+        }
+        /* Use JIT only when head_dim matches compiled kernel */
+        if (jit_fwd_rope_hd && lhd == hd && layer_rope_dim == hd && !m->is_gemma4) {
+            llm_rope_precompute(layer_rope_base, lhd, rope_f);
             for (int h = 0; h < n_heads; h++)
-                jit_fwd_rope_hd(llm_q + h * hd, pos, hd, llm_rope_freqs_buf);
-            for (int h = 0; h < n_kv; h++)
-                jit_fwd_rope_hd(llm_k_buf + h * hd, pos, hd, llm_rope_freqs_buf);
+                jit_fwd_rope_hd(llm_q + h * lhd, pos, lhd, llm_rope_freqs_buf);
+            if (has_own_kv)
+                for (int h = 0; h < n_kv; h++)
+                    jit_fwd_rope_hd(llm_k_buf + h * lhd, pos, lhd, llm_rope_freqs_buf);
         } else {
+            int rdim = m->rope_dim > 0 ? m->rope_dim : layer_rope_dim;
             for (int h = 0; h < n_heads; h++)
-                llm_rope(llm_q + h * hd, pos, rope_dim, m->rope_base, rope_f);
-            for (int h = 0; h < n_kv; h++)
-                llm_rope(llm_k_buf + h * hd, pos, rope_dim, m->rope_base, rope_f);
+                llm_rope(llm_q + h * lhd, pos, rdim, layer_rope_base, rope_f);
+            if (has_own_kv)
+                for (int h = 0; h < n_kv; h++)
+                    llm_rope(llm_k_buf + h * lhd, pos, rdim, layer_rope_base, rope_f);
         }
 
-        /* 2d. Store K,V in cache (memcpy instead of scalar loop) */
-        /* KV cache layout: [layer][position][kv_head][head_dim] */
+        /* 2d. Store K,V in cache */
+        /* KV cache layout: [layer][position][kv_head][max_head_dim]
+         * All layers use the same stride (max head_dim = hd) even if
+         * this layer's actual lhd < hd — we just zero-pad. */
         int kv_stride = m->max_seq * kv_dim;
-        float *kc = m->k_cache + L * kv_stride + pos * kv_dim;
-        float *vc = m->v_cache + L * kv_stride + pos * kv_dim;
-        kmemcpy(kc, llm_k_buf, kv_dim * sizeof(float));
-        kmemcpy(vc, llm_v_buf, kv_dim * sizeof(float));
+        int kv_src_layer = has_own_kv ? L : layer->kv_reuse_layer;
+        if (has_own_kv) {
+            /* Write K/V to this layer's cache slot.
+             * If lhd < hd, we write lkv_dim floats into a kv_dim slot — pad rest with 0. */
+            float *kc = m->k_cache + L * kv_stride + pos * kv_dim;
+            float *vc = m->v_cache + L * kv_stride + pos * kv_dim;
+            if (lkv_dim < kv_dim) {
+                kmemset(kc, 0, kv_dim * sizeof(float));
+                kmemset(vc, 0, kv_dim * sizeof(float));
+            }
+            /* For GQA with potentially smaller head_dim, copy per-head */
+            for (int h = 0; h < n_kv; h++) {
+                kmemcpy(kc + h * hd, llm_k_buf + h * lhd, lhd * sizeof(float));
+                kmemcpy(vc + h * hd, llm_v_buf + h * lhd, lhd * sizeof(float));
+            }
+        }
 
-        /* 2e. Multi-head attention with GQA (Grouped Query Attention) */
-        kmemset(llm_attn_out, 0, dim * sizeof(float));
+        /* 2e. Multi-head attention with GQA */
+        kmemset(llm_attn_out, 0, lq_dim * sizeof(float));
 
-        int heads_per_kv = n_heads / n_kv;  /* GQA group size */
+        int heads_per_kv = n_heads / n_kv;
+
+        /* Gemma4: attention scaling = 1.0 (pre-normalized by Q/K norms) */
+        float attn_scale = m->is_gemma4 ? 1.0f : (1.0f / llm_sqrtf((float)lhd));
 
         for (int h = 0; h < n_heads; h++) {
-            int kv_h = h / heads_per_kv;  /* which KV head this Q head attends to */
-            float *qh = llm_q + h * hd;
-            float scale = 1.0f / llm_sqrtf((float)hd);
+            int kv_h = h / heads_per_kv;
+            float *qh = llm_q + h * lhd;
 
-            /* Compute attention scores: score[t] = Q_h · K_t / sqrt(d) */
             int seq_len = pos + 1;
             for (int t = 0; t < seq_len; t++) {
-                float *kt = m->k_cache + L * kv_stride + t * kv_dim + kv_h * hd;
-                float d = jit_fwd_dot_hd
-                    ? jit_fwd_dot_hd(qh, kt, hd)
-                    : llm_dot_f32(qh, kt, hd);
-                llm_attn_scores[t] = d * scale;
-            }
-
-            /* Debug: show PRE-softmax attention scores for L0, H0 */
-            if (L == 0 && h == 0 && fwd_dbg_count > 0 && fwd_dbg_count < 3 && seq_len > 1) {
-                kprintf("[DBG] L0H0 pre_softmax (pos=%d):", pos);
-                for (int t = 0; t < seq_len && t < 16; t++)
-                    kprintf(" %.3f", (double)llm_attn_scores[t]);
-                kprintf("\n");
+                float *kt = m->k_cache + kv_src_layer * kv_stride + t * kv_dim + kv_h * hd;
+                /* Dot product uses lhd (actual head dim for this layer) */
+                float d = llm_dot_f32(qh, kt, lhd);
+                llm_attn_scores[t] = d * attn_scale;
             }
 
             /* Softmax over scores */
             llm_softmax(llm_attn_scores, seq_len);
 
-            /* Debug: show attention pattern for L0, H0 on last prefill token */
-            if (L == 0 && h == 0 && fwd_dbg_count > 0 && fwd_dbg_count < 3 && seq_len > 1) {
-                /* Show pre-softmax scores too */
-                float pre_max = llm_attn_scores[0];
-                /* Note: scores already softmaxed above, so recompute raw for debug */
-                kprintf("[DBG] L0H0 attn_post (pos=%d, seq_len=%d):", pos, seq_len);
-                for (int t = 0; t < seq_len && t < 16; t++)
-                    kprintf(" %.3f", (double)llm_attn_scores[t]);
-                kprintf("\n");
-            }
-
-            /* Weighted sum of V: head_out = sum_t(score[t] * V_t) */
-            kmemset(llm_head_buf, 0, hd * sizeof(float));
+            /* Weighted sum of V */
+            kmemset(llm_head_buf, 0, lhd * sizeof(float));
             for (int t = 0; t < seq_len; t++) {
                 float s = llm_attn_scores[t];
-                float *vt = m->v_cache + L * kv_stride + t * kv_dim + kv_h * hd;
-                if (jit_fwd_axpy_hd)
-                    jit_fwd_axpy_hd(llm_head_buf, s, vt, hd);
-                else
-                    llm_axpy_f32(llm_head_buf, s, vt, hd);
+                float *vt = m->v_cache + kv_src_layer * kv_stride + t * kv_dim + kv_h * hd;
+                llm_axpy_f32(llm_head_buf, s, vt, lhd);
             }
 
-            /* Copy head output to concat buffer */
-            kmemcpy(llm_attn_out + h * hd, llm_head_buf, hd * sizeof(float));
+            kmemcpy(llm_attn_out + h * lhd, llm_head_buf, lhd * sizeof(float));
         }
 
         /* 2f. Output projection + residual */
-        llm_gemv(llm_ffn_d, layer->o_weight, llm_attn_out, dim, dim, layer->o_type);
-        llm_add_bias(llm_ffn_d, layer->o_bias, dim);
+        llm_gemv(llm_ffn_d, layer->o_weight, llm_attn_out, dim, lq_dim, layer->o_type);
+
+        /* Gemma4: post-attention RMSNorm */
+        if (layer->post_attn_norm) {
+            llm_rmsnorm(llm_ffn_d, llm_ffn_d, layer->post_attn_norm, dim,
+                        GGML_TYPE_F32, m->rms_eps);
+        }
+
         if (jit_fwd_vadd_dim)
             jit_fwd_vadd_dim(llm_x, llm_ffn_d, dim);
         else
             llm_vadd_f32(llm_x, llm_ffn_d, dim);
 
         /* === Feed-Forward Network === */
+
+        /* Per-layer FFN dim (Gemma4: 6144 for early layers, 12288 for later) */
+        int lff = layer->ff_dim_layer ? layer->ff_dim_layer : ff;
 
         /* 2g. Pre-FFN norm (LayerNorm for Phi-2, RMSNorm for others) */
         if (m->use_layernorm)
@@ -2663,52 +2762,76 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
 
         if (m->use_gelu || !layer->ffn_gate) {
             /* 2h-alt. GELU FFN (Phi-2): hidden = GELU(W_up · x); out = W_down · hidden */
-            llm_gemv(llm_ffn_u, layer->ffn_up, llm_xn, ff, dim, layer->up_type);
-            llm_add_bias(llm_ffn_u, layer->ffn_up_bias, ff);
-            llm_gelu(llm_ffn_u, ff);
-            llm_gemv(llm_ffn_d, layer->ffn_down, llm_ffn_u, dim, ff, layer->down_type);
+            llm_gemv(llm_ffn_u, layer->ffn_up, llm_xn, lff, dim, layer->up_type);
+            llm_add_bias(llm_ffn_u, layer->ffn_up_bias, lff);
+            llm_gelu(llm_ffn_u, lff);
+            llm_gemv(llm_ffn_d, layer->ffn_down, llm_ffn_u, dim, lff, layer->down_type);
             llm_add_bias(llm_ffn_d, layer->ffn_down_bias, dim);
+        } else if (m->use_geglu) {
+            /* 2h-geglu. GeGLU (Gemma): hidden = GELU(W_gate · x) ⊙ (W_up · x) */
+            llm_gemv(llm_ffn_g, layer->ffn_gate, llm_xn, lff, dim, layer->gate_type);
+            llm_gemv(llm_ffn_u, layer->ffn_up,   llm_xn, lff, dim, layer->up_type);
+            llm_gelu(llm_ffn_g, lff);
+            llm_vmul_f32(llm_ffn_g, llm_ffn_u, lff);
+            llm_gemv(llm_ffn_d, layer->ffn_down, llm_ffn_g, dim, lff, layer->down_type);
         } else {
             /* 2h. SwiGLU: hidden = SiLU(W_gate · x) ⊙ (W_up · x) */
-            llm_gemv(llm_ffn_g, layer->ffn_gate, llm_xn, ff, dim, layer->gate_type);
-            llm_gemv(llm_ffn_u, layer->ffn_up,   llm_xn, ff, dim, layer->up_type);
-            if (jit_fwd_fused_silu) {
-                jit_fwd_fused_silu(llm_ffn_g, llm_ffn_u, ff);
+            llm_gemv(llm_ffn_g, layer->ffn_gate, llm_xn, lff, dim, layer->gate_type);
+            llm_gemv(llm_ffn_u, layer->ffn_up,   llm_xn, lff, dim, layer->up_type);
+            if (jit_fwd_fused_silu && lff == ff) {
+                jit_fwd_fused_silu(llm_ffn_g, llm_ffn_u, lff);
             } else {
-                llm_silu(llm_ffn_g, ff);
-                llm_vmul_f32(llm_ffn_g, llm_ffn_u, ff);
+                llm_silu(llm_ffn_g, lff);
+                llm_vmul_f32(llm_ffn_g, llm_ffn_u, lff);
             }
-            llm_gemv(llm_ffn_d, layer->ffn_down, llm_ffn_g, dim, ff, layer->down_type);
+            llm_gemv(llm_ffn_d, layer->ffn_down, llm_ffn_g, dim, lff, layer->down_type);
         }
+
+        /* Gemma4: post-FFW RMSNorm */
+        if (layer->post_ffw_norm) {
+            llm_rmsnorm(llm_ffn_d, llm_ffn_d, layer->post_ffw_norm, dim,
+                        GGML_TYPE_F32, m->rms_eps);
+        }
+
+        /* Residual: x = x + ffn_output */
         if (jit_fwd_vadd_dim)
             jit_fwd_vadd_dim(llm_x, llm_ffn_d, dim);
         else
             llm_vadd_f32(llm_x, llm_ffn_d, dim);
 
-        /* Debug: check hidden state after first layer */
-        if (fwd_dbg_count == 0 && L == 0) {
-            float hmin = llm_x[0], hmax = llm_x[0], hsum = 0.0f;
-            int hzero = 0;
-            for (int i = 0; i < dim; i++) {
-                if (llm_x[i] < hmin) hmin = llm_x[i];
-                if (llm_x[i] > hmax) hmax = llm_x[i];
-                hsum += llm_x[i] > 0 ? llm_x[i] : -llm_x[i];
-                if (llm_x[i] == 0.0f) hzero++;
+        /* === Gemma4 ISWA: Per-layer embedding injection === */
+        if (m->is_gemma4 && layer->iswa_inp_gate) {
+            int iswa_d = m->iswa_n_embd; /* 256 */
+
+            /* 2j-a. Gate: tmp[256] = GELU(inp_gate[1536,256] · x[1536]) */
+            llm_gemv(llm_iswa_tmp, layer->iswa_inp_gate, llm_x, iswa_d, dim,
+                     layer->iswa_inp_gate_type);
+            llm_gelu(llm_iswa_tmp, iswa_d);
+
+            /* 2j-b. Element-wise multiply with per-layer embedding */
+            float *pl = llm_iswa_per_layer + L * iswa_d;
+            for (int i = 0; i < iswa_d; i++)
+                llm_iswa_tmp[i] *= pl[i];
+
+            /* 2j-c. Project back: ffn_d[1536] = proj[256,1536] · tmp[256] */
+            llm_gemv(llm_ffn_d, layer->iswa_proj, llm_iswa_tmp, dim, iswa_d,
+                     layer->iswa_proj_type);
+
+            /* 2j-d. Post-norm on projected output */
+            if (layer->iswa_post_norm) {
+                llm_rmsnorm(llm_ffn_d, llm_ffn_d, layer->iswa_post_norm, dim,
+                            GGML_TYPE_F32, m->rms_eps);
             }
-            kprintf("[DBG] after L0: min=%.4f max=%.4f abssum=%.2f zeros=%d/%d\n",
-                    (double)hmin, (double)hmax, (double)hsum, hzero, dim);
+
+            /* 2j-e. Residual: x = x + iswa_output */
+            llm_vadd_f32(llm_x, llm_ffn_d, dim);
         }
-        /* Check last layer output too */
-        if (fwd_dbg_count == 0 && L == m->n_layers - 1) {
-            float hmin = llm_x[0], hmax = llm_x[0], hsum = 0.0f;
-            for (int i = 0; i < dim; i++) {
-                if (llm_x[i] < hmin) hmin = llm_x[i];
-                if (llm_x[i] > hmax) hmax = llm_x[i];
-                hsum += llm_x[i] > 0 ? llm_x[i] : -llm_x[i];
-            }
-            kprintf("[DBG] after L%d: min=%.4f max=%.4f abssum=%.2f\n",
-                    L, (double)hmin, (double)hmax, (double)hsum);
-            fwd_dbg_count = 1;
+
+        /* === Gemma4: Per-layer output scaling === */
+        if (layer->iswa_out_scale) {
+            float s = ((const float *)layer->iswa_out_scale)[0];
+            for (int i = 0; i < dim; i++)
+                llm_x[i] *= s;
         }
     }
 
@@ -2723,28 +2846,19 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
     const void *lm_head = m->output_weight ? m->output_weight : m->token_embd;
     ggml_type_t lm_type = m->output_weight ? m->output_type : m->token_embd_type;
 
-    /* Debug: check input to LM head on first call */
-    if (fwd_dbg_count == 1) {
-        /* Check final norm output */
-        float nmin = llm_xn[0], nmax = llm_xn[0], nsum = 0.0f;
-        int nzero = 0;
-        for (int i = 0; i < dim; i++) {
-            if (llm_xn[i] < nmin) nmin = llm_xn[i];
-            if (llm_xn[i] > nmax) nmax = llm_xn[i];
-            nsum += llm_xn[i] > 0 ? llm_xn[i] : -llm_xn[i];
-            if (llm_xn[i] == 0.0f) nzero++;
-        }
-        /* Check first few bytes of lm_head weight */
-        const uint8_t *wb = (const uint8_t *)lm_head;
-        int wz = 0;
-        for (int i = 0; i < 1024 && wb; i++)
-            if (wb[i] == 0) wz++;
-        kprintf("[DBG] LM head: xn min=%.4f max=%.4f zeros=%d type=%d wt_addr=%p wt_zero1k=%d vs=%d\n",
-                (double)nmin, (double)nmax, nzero, (int)lm_type, lm_head, wz, m->vocab_size);
-        fwd_dbg_count = 2;
-    }
-
     llm_gemv(logits, lm_head, llm_xn, m->vocab_size, dim, lm_type);
+
+    /* 5. Logit softcapping: logits = cap * tanh(logits / cap) */
+    if (m->logit_softcap > 0.0f) {
+        float cap = m->logit_softcap;
+        float inv_cap = 1.0f / cap;
+        for (int i = 0; i < m->vocab_size; i++) {
+            float x = logits[i] * inv_cap;
+            /* tanh approximation: tanh(x) = (exp(2x) - 1) / (exp(2x) + 1) */
+            float e2x = llm_expf(2.0f * x);
+            logits[i] = cap * (e2x - 1.0f) / (e2x + 1.0f);
+        }
+    }
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -2803,12 +2917,13 @@ static int llm_build_vocab(llm_model_t *m, gguf_ctx_t *ctx)
         n_vocab = m->vocab_size;
     m->n_vocab = n_vocab;
 
-    /* Allocate vocab array in the model cache region (after GGUF data) */
-    uint8_t *alloc_ptr = (uint8_t *)m->data_buf + m->data_size;
-    /* Align to 8 bytes */
-    alloc_ptr = (uint8_t *)(((uint64_t)alloc_ptr + 7) & ~7ULL);
-    m->vocab = (llm_vocab_entry_t *)alloc_ptr;
-    alloc_ptr += n_vocab * sizeof(llm_vocab_entry_t);
+    /* Allocate vocab array */
+    m->vocab = (llm_vocab_entry_t *)tensor_alloc(
+        (uint64_t)n_vocab * sizeof(llm_vocab_entry_t));
+    if (!m->vocab) {
+        kprintf("[LLM] ERROR: Failed to allocate vocab (%d entries)\n", n_vocab);
+        return -1;
+    }
 
     /* Walk the string array and populate vocab entries */
     const uint8_t *p = (const uint8_t *)tok_kv->value.array.data;
@@ -3092,20 +3207,35 @@ static int llm_tokenize(const llm_model_t *m, const char *text,
     int text_len = 0;
     for (const char *p = text; *p; p++) text_len++;
 
-    /* Pre-split at special token boundaries (<|...|> patterns).
-     * Special tokens are looked up directly in vocab without SentencePiece encoding. */
+    /* Pre-split at special token boundaries.
+     * Detect both <|...|> patterns (GPT/Phi) and <..._of_...> patterns (Gemma). */
     int pos = 0;
     int first_seg = 1;
     while (pos < text_len && n < max_tokens) {
-        /* Scan for next <|...|> pattern */
+        /* Scan for next special token pattern */
         int spec_start = -1, spec_end = -1;
-        for (int i = pos; i < text_len - 3; i++) {
-            if (text[i] == '<' && text[i+1] == '|') {
-                /* Find closing |> */
-                for (int j = i + 2; j < text_len - 1 && j < i + 32; j++) {
-                    if (text[j] == '|' && text[j+1] == '>') {
-                        spec_start = i;
-                        spec_end = j + 2;
+        for (int i = pos; i < text_len - 2; i++) {
+            if (text[i] == '<') {
+                /* Try <|...|> pattern */
+                if (i + 3 < text_len && text[i+1] == '|') {
+                    for (int j = i + 2; j < text_len - 1 && j < i + 32; j++) {
+                        if (text[j] == '|' && text[j+1] == '>') {
+                            spec_start = i;
+                            spec_end = j + 2;
+                            break;
+                        }
+                    }
+                    if (spec_start >= 0) break;
+                }
+                /* Try <...> pattern — look up in vocab to confirm it's a special token */
+                for (int j = i + 1; j < text_len && j < i + 32; j++) {
+                    if (text[j] == '>') {
+                        int cand_len = j + 1 - i;
+                        int cand_id = llm_find_token(m, text + i, cand_len);
+                        if (cand_id >= 0) {
+                            spec_start = i;
+                            spec_end = j + 1;
+                        }
                         break;
                     }
                 }
@@ -3132,9 +3262,6 @@ static int llm_tokenize(const llm_model_t *m, const char *text,
         /* Look up the special token directly in vocab */
         int spec_len = spec_end - spec_start;
         int spec_id = llm_find_token(m, text + spec_start, spec_len);
-        kprintf("[DBG] special token lookup: '");
-        for (int z = 0; z < spec_len && z < 20; z++) kprintf("%c", text[spec_start+z]);
-        kprintf("' len=%d id=%d\n", spec_len, spec_id);
         if (spec_id >= 0 && n < max_tokens) {
             tokens[n++] = spec_id;
         } else if (n < max_tokens) {
@@ -3369,64 +3496,14 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
     /* Get next token from the last forward pass */
     int next = llm_sample(llm_logits, m->vocab_size, temperature);
 
-    /* Debug: log first generated token and logits shape (disabled for performance) */
-    if (0) {
-        float lmin = llm_logits[0], lmax = llm_logits[0];
-        int nzero = 0, nnan = 0;
-        for (int i = 0; i < m->vocab_size; i++) {
-            if (llm_logits[i] < lmin) lmin = llm_logits[i];
-            if (llm_logits[i] > lmax) lmax = llm_logits[i];
-            if (llm_logits[i] == 0.0f) nzero++;
-            /* NaN check: a != a */
-            if (llm_logits[i] != llm_logits[i]) nnan++;
-        }
-        kprintf("[DBG] first token=%d logit_min=%.4f logit_max=%.4f zeros=%d nan=%d prompt=%d\n",
-                next, (double)lmin, (double)lmax, nzero, nnan, n_prompt);
-        /* Top-5 logits */
-        int top5[5] = {0,0,0,0,0};
-        for (int t = 0; t < 5; t++) {
-            float best = -1e30f;
-            for (int i = 0; i < m->vocab_size; i++) {
-                int skip = 0;
-                for (int tt = 0; tt < t; tt++) if (top5[tt] == i) skip = 1;
-                if (!skip && llm_logits[i] > best) { best = llm_logits[i]; top5[t] = i; }
-            }
-        }
-        kprintf("[DBG] top5: %d(%.2f) %d(%.2f) %d(%.2f) %d(%.2f) %d(%.2f)\n",
-                top5[0], (double)llm_logits[top5[0]],
-                top5[1], (double)llm_logits[top5[1]],
-                top5[2], (double)llm_logits[top5[2]],
-                top5[3], (double)llm_logits[top5[3]],
-                top5[4], (double)llm_logits[top5[4]]);
-        /* Decode top5 token names */
-        for (int t = 0; t < 5; t++) {
-            char tbuf[64]; int tl = llm_decode_token(m, top5[t], tbuf, sizeof(tbuf));
-            if (tl > 20) tl = 20;
-            tbuf[tl] = '\0';
-            kprintf("[DBG]   top%d: id=%d '%s'\n", t+1, top5[t], tbuf);
-        }
-        /* Print prompt tokens */
-        kprintf("[DBG] prompt tokens:");
-        for (int i = 0; i < n_prompt && i < 32; i++)
-            kprintf(" %d", prompt_tokens[i]);
-        kprintf("\n");
-        /* Decode each prompt token */
-        kprintf("[DBG] prompt text: ");
-        for (int i = 0; i < n_prompt && i < 32; i++) {
-            char tbuf[64]; int tl = llm_decode_token(m, prompt_tokens[i], tbuf, sizeof(tbuf));
-            if (tl > 30) tl = 30;
-            tbuf[tl] = '\0';
-            kprintf("[%s]", tbuf);
-        }
-        kprintf("\n");
-    }
-
     uint64_t t_gen_start = rdtsc_fenced();
     int consec_nl = 0;  /* consecutive newline counter */
 
     for (int g = 0; g < max_gen && pos < m->max_seq; g++) {
         /* Check for EOS BEFORE decoding its text */
         if (next == m->eos_id) break;
+        /* Gemma turn marker (106 = <turn|>) always signals end of response */
+        if (next == 106) break;
 
         /* Decode token to text */
         char tok_buf[128];
@@ -3435,6 +3512,24 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
             output_text[out_pos++] = tok_buf[i];
         output_text[out_pos] = '\0';
         gen_count++;
+
+        /* Streaming callback: emit token, replacing UTF-8 ▁ (E2 96 81) with space */
+        if (llm_stream_cb) {
+            char stream_buf[128];
+            int si = 0;
+            for (int i = 0; i < tok_len; ) {
+                unsigned char c = (unsigned char)tok_buf[i];
+                if (c == 0xE2 && i + 2 < tok_len &&
+                    (unsigned char)tok_buf[i+1] == 0x96 &&
+                    (unsigned char)tok_buf[i+2] == 0x81) {
+                    stream_buf[si++] = ' ';
+                    i += 3;
+                } else {
+                    stream_buf[si++] = tok_buf[i++];
+                }
+            }
+            if (si > 0) llm_stream_cb(stream_buf, si, llm_stream_cb_ud);
+        }
 
         /* Check for <|im_end|> or <|endoftext|> in recent text */
         if (out_pos >= 10) {
@@ -3468,12 +3563,6 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
         /* Sample next token */
         last_token = next;
         next = llm_sample(llm_logits, m->vocab_size, temperature);
-
-        /* Debug: print second and third token info (disabled for performance) */
-        if (0 && (g == 0 || g == 1)) {
-            kprintf("[DBG] gen[%d] next=%d logit_max=%.2f pos=%d\n",
-                    g+1, next, (double)llm_logits[next], pos);
-        }
     }
     uint64_t t_gen_end = rdtsc_fenced();
 
@@ -3524,6 +3613,8 @@ static int llm_map_tensors(llm_model_t *m, gguf_ctx_t *ctx)
         }
         m->token_embd = t->data;
         m->token_embd_type = t->type;
+        kprintf("[LLM] token_embd.weight: type=%d dims=[%llu,%llu]\n",
+                (int)t->type, t->dims[0], t->dims[1]);
     }
 
     /* Output norm */
@@ -3567,6 +3658,21 @@ static int llm_map_tensors(llm_model_t *m, gguf_ctx_t *ctx)
                     (const void *)m->rope_factors_short, (const void *)m->rope_factors_long);
     }
 
+    /* Gemma4 ISWA global weights */
+    if (m->is_gemma4 && m->iswa_n_embd > 0) {
+        const gguf_tensor_info_t *t;
+        t = gguf_find_tensor(ctx, "per_layer_token_embd.weight");
+        if (t) { m->iswa_tok_embd = t->data; m->iswa_tok_embd_type = t->type;
+                 kprintf("[LLM] ISWA: per_layer_token_embd [%llu x %llu]\n", t->dims[0], t->dims[1]); }
+        t = gguf_find_tensor(ctx, "per_layer_model_proj.weight");
+        if (t) { m->iswa_model_proj = t->data; m->iswa_model_proj_type = t->type; }
+        t = gguf_find_tensor(ctx, "per_layer_proj_norm.weight");
+        if (t) { m->iswa_proj_norm = t->data; }
+        t = gguf_find_tensor(ctx, "rope_freqs.weight");
+        if (t) { m->rope_freqs = (const float *)t->data;
+                 kprintf("[LLM] ISWA: rope_freqs [%llu]\n", t->dims[0]); }
+    }
+
     /* Per-layer weights */
     char name_buf[128];
     for (int L = 0; L < m->n_layers; L++) {
@@ -3590,14 +3696,6 @@ static int llm_map_tensors(llm_model_t *m, gguf_ctx_t *ctx)
         } while(0)
 
         MAP_TENSOR(attn_norm,  "attn_norm.weight",   attn_norm_type);
-
-        /* Debug: print actual raw GGUF type for attn_norm */
-        if (L == 0) {
-            kstrcpy(name_buf, "blk.0.attn_norm.weight");
-            const gguf_tensor_info_t *nt = gguf_find_tensor(ctx, name_buf);
-            if (nt) kprintf("[DBG] blk.0.attn_norm.weight: raw_type=%d size=%lu elems=%lu\n",
-                            (int)nt->type, (unsigned long)nt->size_bytes, (unsigned long)nt->n_elements);
-        }
         MAP_TENSOR(q_weight,   "attn_q.weight",      q_type);
         MAP_TENSOR(k_weight,   "attn_k.weight",      k_type);
         MAP_TENSOR(v_weight,   "attn_v.weight",      v_type);
@@ -3691,9 +3789,7 @@ static int llm_map_tensors(llm_model_t *m, gguf_ctx_t *ctx)
               num[j_] = '\0';
               kstrcpy(name_buf + kstrlen(name_buf), num); }
             kstrcpy(name_buf + kstrlen(name_buf), ".attn_qkv.bias");
-            if (L == 0) kprintf("[DBG] Looking for '%s'\n", name_buf);
             const gguf_tensor_info_t *qkv_b = gguf_find_tensor(ctx, name_buf);
-            if (L == 0) kprintf("[DBG] qkv_b=%p\n", (void*)qkv_b);
             if (qkv_b) {
                 const float *bb = (const float *)qkv_b->data;
                 int q_dim = m->n_heads * m->head_dim;
@@ -3701,24 +3797,92 @@ static int llm_map_tensors(llm_model_t *m, gguf_ctx_t *ctx)
                 layer->q_bias = bb;
                 layer->k_bias = bb + q_dim;
                 layer->v_bias = bb + q_dim + k_dim;
-                if (L == 0)
-                    kprintf("[LLM] Fused QKV bias loaded (q=%d k=%d v=%d)\n",
-                            q_dim, k_dim, k_dim);
-            } else if (L == 0) {
-                kprintf("[DBG] No fused QKV bias found\n");
-                /* Print first 20 tensor names */
-                for (uint32_t ti = 0; ti < ctx->tensor_count && ti < 20; ti++) {
-                    char tn[64];
-                    uint32_t nlen = ctx->tensors[ti].name.len;
-                    if (nlen > 63) nlen = 63;
-                    kmemcpy(tn, ctx->tensors[ti].name.data, nlen);
-                    tn[nlen] = '\0';
-                    kprintf("[DBG]   t[%d]='%s'\n", ti, tn);
-                }
             }
         }
 
         #undef MAP_BIAS
+
+        /* Gemma4: per-layer Q/K norm, post-attention norm, post-FFW norm, ISWA */
+        layer->q_norm = (void *)0;
+        layer->k_norm = (void *)0;
+        layer->post_attn_norm = (void *)0;
+        layer->post_ffw_norm = (void *)0;
+        layer->iswa_inp_gate = (void *)0;
+        layer->iswa_proj = (void *)0;
+        layer->iswa_post_norm = (void *)0;
+        layer->iswa_out_scale = (void *)0;
+        layer->head_dim_layer = m->head_dim;
+        layer->kv_reuse_layer = -1;
+        layer->ff_dim_layer = m->ff_dim;
+        if (m->is_gemma4) {
+            #define BUILD_BLK_NAME(suffix) do { \
+                kstrcpy(name_buf, "blk."); \
+                { char num[8]; int n_ = L, j_ = 0; \
+                  if (n_ == 0) { num[j_++] = '0'; } \
+                  else { char tmp[8]; int k_ = 0; while (n_ > 0) { tmp[k_++] = '0' + (n_ % 10); n_ /= 10; } \
+                         while (k_ > 0) num[j_++] = tmp[--k_]; } \
+                  num[j_] = '\0'; \
+                  kstrcpy(name_buf + kstrlen(name_buf), num); } \
+                kstrcpy(name_buf + kstrlen(name_buf), "." suffix); \
+            } while(0)
+            /* Q/K norms: blk.N.attn_q_norm.weight, blk.N.attn_k_norm.weight */
+            BUILD_BLK_NAME("attn_q_norm.weight");
+            { const gguf_tensor_info_t *t = gguf_find_tensor(ctx, name_buf);
+              if (t) { layer->q_norm = t->data; } }
+            BUILD_BLK_NAME("attn_k_norm.weight");
+            { const gguf_tensor_info_t *t = gguf_find_tensor(ctx, name_buf);
+              if (t) { layer->k_norm = t->data; } }
+            /* Post-attention and post-FFW norms */
+            BUILD_BLK_NAME("post_attention_norm.weight");
+            { const gguf_tensor_info_t *t = gguf_find_tensor(ctx, name_buf);
+              if (t) { layer->post_attn_norm = t->data; } }
+            BUILD_BLK_NAME("post_ffw_norm.weight");
+            { const gguf_tensor_info_t *t = gguf_find_tensor(ctx, name_buf);
+              if (t) { layer->post_ffw_norm = t->data; } }
+            /* ISWA per-layer injection tensors */
+            BUILD_BLK_NAME("inp_gate.weight");
+            { const gguf_tensor_info_t *t = gguf_find_tensor(ctx, name_buf);
+              if (t) { layer->iswa_inp_gate = t->data; layer->iswa_inp_gate_type = t->type; } }
+            BUILD_BLK_NAME("proj.weight");
+            { const gguf_tensor_info_t *t = gguf_find_tensor(ctx, name_buf);
+              if (t) { layer->iswa_proj = t->data; layer->iswa_proj_type = t->type; } }
+            BUILD_BLK_NAME("post_norm.weight");
+            { const gguf_tensor_info_t *t = gguf_find_tensor(ctx, name_buf);
+              if (t) { layer->iswa_post_norm = t->data; } }
+            BUILD_BLK_NAME("layer_output_scale.weight");
+            { const gguf_tensor_info_t *t = gguf_find_tensor(ctx, name_buf);
+              if (t) { layer->iswa_out_scale = t->data; } }
+
+            /* Determine per-layer head_dim from Q weight shape */
+            BUILD_BLK_NAME("attn_q.weight");
+            { const gguf_tensor_info_t *t = gguf_find_tensor(ctx, name_buf);
+              if (t && t->n_dims >= 2) {
+                  layer->head_dim_layer = (int)(t->dims[1]) / m->n_heads;
+              } }
+
+            /* Determine per-layer ff_dim from ffn_gate shape */
+            BUILD_BLK_NAME("ffn_gate.weight");
+            { const gguf_tensor_info_t *t = gguf_find_tensor(ctx, name_buf);
+              if (t && t->n_dims >= 2) {
+                  layer->ff_dim_layer = (int)(t->dims[1]);
+              } }
+
+            /* KV cache reuse for layers >= n_layer_kv_start */
+            if (L >= m->n_layer_kv_start) {
+                /* SWA layers reuse kv_start-2, full attn layers reuse kv_start-1 */
+                int is_swa_layer = (layer->head_dim_layer == m->head_dim_swa);
+                layer->kv_reuse_layer = m->n_layer_kv_start - (is_swa_layer ? 2 : 1);
+                if (layer->kv_reuse_layer < 0) layer->kv_reuse_layer = 0;
+            }
+
+            if (L == 0 || L == 4 || L == 15)
+                kprintf("[LLM] L%d: hd=%d ff=%d kv_reuse=%d q_norm=%p proj=%p scale=%p\n",
+                        L, layer->head_dim_layer, layer->ff_dim_layer,
+                        layer->kv_reuse_layer, layer->q_norm, layer->iswa_proj,
+                        layer->iswa_out_scale);
+        }
+
+        #undef BUILD_BLK_NAME
         #undef MAP_TENSOR
 
         /* Validate critical tensors are mapped (after fused fallback) */
@@ -3735,6 +3899,8 @@ static int llm_map_tensors(llm_model_t *m, gguf_ctx_t *ctx)
 }
 
 /* Load model from virtio-blk disk into model_cache memory region */
+static int llm_init_parsed_model(llm_model_t *m);
+
 static int llm_load_from_disk(llm_model_t *m)
 {
 #ifdef __aarch64__
@@ -3796,6 +3962,36 @@ static int llm_load_from_disk(llm_model_t *m)
     kprintf("[LLM] Loaded %lu MB in %lu ms (%lu KB/s)\n",
             capacity / (1024 * 1024), load_ms, mbps);
 
+    return llm_init_parsed_model(m);
+#endif /* __aarch64__ */
+}
+
+/* Hosted-mode loader: load model from a pre-mapped memory buffer */
+int llm_load_from_buffer(void *data, uint64_t size)
+{
+    if (!data || size < 1024) {
+        kprintf("[LLM] Invalid buffer (ptr=%p, size=%lu)\n", data, (unsigned long)size);
+        return -1;
+    }
+    uint32_t magic = (uint32_t)((uint8_t *)data)[0] |
+                     ((uint32_t)((uint8_t *)data)[1] << 8) |
+                     ((uint32_t)((uint8_t *)data)[2] << 16) |
+                     ((uint32_t)((uint8_t *)data)[3] << 24);
+    if (magic != GGUF_MAGIC) {
+        kprintf("[LLM] Not a GGUF file (magic=0x%08x)\n", magic);
+        return -1;
+    }
+    kmemset(&llm_model, 0, sizeof(llm_model));
+    llm_model.data_buf = data;
+    llm_model.data_size = size;
+    kprintf("[LLM] Loading model from buffer: %lu MB\n",
+            (unsigned long)(size / (1024 * 1024)));
+    return llm_init_parsed_model(&llm_model);
+}
+
+/* Shared model initialization after data is in memory */
+static int llm_init_parsed_model(llm_model_t *m)
+{
     /* Parse GGUF */
     kprintf("[LLM] Parsing GGUF...\n");
     int rc = gguf_parse(&llm_gguf_ctx, m->data_buf, m->data_size);
@@ -3837,12 +4033,52 @@ static int llm_load_from_disk(llm_model_t *m)
     }
 
     /* Compute derived parameters */
-    if (m->n_heads > 0)
+    if (llm_gguf_ctx.n_embd_head_k > 0)
+        m->head_dim = (int)llm_gguf_ctx.n_embd_head_k;
+    else if (m->n_heads > 0)
         m->head_dim = m->dim / m->n_heads;
     else
         m->head_dim = 64;
     if (m->n_kv_heads == 0) m->n_kv_heads = m->n_heads;
     if (m->rope_base < 1.0f) m->rope_base = 10000.0f;
+
+    /* Gemma-family detection (gemma, gemma2, gemma4, etc.) */
+    int is_gemma = (kstrlen(m->arch) >= 5 &&
+        m->arch[0] == 'g' && m->arch[1] == 'e' &&
+        m->arch[2] == 'm' && m->arch[3] == 'm' && m->arch[4] == 'a');
+
+    /* Embedding scaling: Gemma models scale embeddings by sqrt(dim) */
+    m->embed_scale = is_gemma ? llm_sqrtf((float)m->dim) : 1.0f;
+
+    /* GeGLU: Gemma models use GELU activation with gating (not SiLU) */
+    m->use_geglu = is_gemma;
+
+    /* Logit softcapping from GGUF metadata */
+    m->logit_softcap = llm_gguf_ctx.final_logit_softcap;
+
+    /* Gemma4 specific: per-layer head_dim, KV sharing, SWA RoPE */
+    m->is_gemma4 = 0;
+    m->head_dim_swa = 0;
+    m->rope_base_swa = 0.0f;
+    m->n_layer_kv_start = m->n_layers; /* default: all layers have own KV */
+    m->iswa_tok_embd = (void *)0;
+    m->iswa_model_proj = (void *)0;
+    m->iswa_proj_norm = (void *)0;
+    m->iswa_n_embd = 0;
+    m->rope_freqs = (const float *)0;
+    if (is_gemma && kstrlen(m->arch) >= 6 && m->arch[5] == '4') {
+        m->is_gemma4 = 1;
+        m->head_dim_swa = (int)llm_gguf_ctx.n_embd_head_k_swa;
+        if (m->head_dim_swa == 0) m->head_dim_swa = m->head_dim; /* fallback */
+        m->rope_base_swa = llm_gguf_ctx.rope_freq_base_swa;
+        if (m->rope_base_swa < 1.0f) m->rope_base_swa = 10000.0f;
+        /* KV sharing: n_layer_kv_start = n_layers - shared_kv_layers */
+        if (llm_gguf_ctx.shared_kv_layers > 0)
+            m->n_layer_kv_start = m->n_layers - (int)llm_gguf_ctx.shared_kv_layers;
+        m->iswa_n_embd = (int)llm_gguf_ctx.n_embd_per_layer;
+        kprintf("[LLM] Gemma4: head_dim_swa=%d rope_base_swa=%.0f kv_start=%d iswa_embd=%d\n",
+                m->head_dim_swa, (double)m->rope_base_swa, m->n_layer_kv_start, m->iswa_n_embd);
+    }
 
     /* Determine max sequence length from GGUF (already parsed by arch prefix) */
     int ctx_len = (int)llm_gguf_ctx.n_ctx;
@@ -3928,8 +4164,11 @@ static int llm_load_from_disk(llm_model_t *m)
 
     /* Print model info (concise for boot) */
     kprintf("[LLM] Model: %s (%s)\n", m->name, m->arch);
-    kprintf("[LLM] %d layers, %d-dim, %d vocab, %d heads (%d KV)\n",
-            m->n_layers, m->dim, m->vocab_size, m->n_heads, m->n_kv_heads);
+    kprintf("[LLM] %d layers, %d-dim, %d vocab, %d heads (%d KV), head_dim=%d\n",
+            m->n_layers, m->dim, m->vocab_size, m->n_heads, m->n_kv_heads, m->head_dim);
+    if (is_gemma)
+        kprintf("[LLM] Gemma mode: embed_scale=%.1f geglu=%d softcap=%.1f\n",
+                (double)m->embed_scale, m->use_geglu, (double)m->logit_softcap);
 
     /* Validate basic sanity */
     if (m->dim <= 0 || m->n_layers <= 0 || m->n_heads <= 0) {
@@ -3949,12 +4188,30 @@ static int llm_load_from_disk(llm_model_t *m)
     m->n_layers_alloc = m->n_layers;
 
     /* Map tensors */
+    kprintf("[LLM] About to map tensors...\n");
     rc = llm_map_tensors(m, &llm_gguf_ctx);
     if (rc != 0) return rc;
+
+    /* Gemma4: feed_forward_length is stored as an array in GGUF, so n_ff=0.
+       Derive m->ff_dim from the per-layer ff_dim_layer values set by tensor loading. */
+    if (m->ff_dim == 0 && m->n_layers > 0) {
+        int max_ff = 0;
+        for (int i = 0; i < m->n_layers; i++) {
+            if (m->layers[i].ff_dim_layer > max_ff)
+                max_ff = m->layers[i].ff_dim_layer;
+        }
+        if (max_ff > 0) {
+            m->ff_dim = max_ff;
+            kprintf("[LLM] Derived ff_dim=%d from per-layer tensor shapes\n", max_ff);
+        }
+    }
+
+    kprintf("[LLM] Tensors mapped, building vocab...\n");
 
     /* Build vocabulary */
     rc = llm_build_vocab(m, &llm_gguf_ctx);
     if (rc != 0) return rc;
+    kprintf("[LLM] Vocab built (%d tokens), allocating scratch...\n", m->n_vocab);
 
     /* Final vocab_size sanity: prefer tokenizer count over GGUF metadata */
     if (m->n_vocab > 0 && m->n_vocab != m->vocab_size) {
@@ -3976,7 +4233,6 @@ static int llm_load_from_disk(llm_model_t *m)
     kprintf("[LLM] Model loaded successfully! Ready for inference.\n");
 
     return 0;
-#endif /* __aarch64__ */
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -4372,6 +4628,36 @@ uint64_t llm_param_count(void)
     return total;
 }
 
+int llm_set_backend(llm_backend_t backend)
+{
+    switch (backend) {
+    case LLM_BACKEND_CPU:
+        llm_backend = backend;
+        return 0;
+    case LLM_BACKEND_CUDA:
+    case LLM_BACKEND_MLIR:
+        /* Backend scaffolding is in place; kernels/runtime are pending. */
+        return -2;
+    default:
+        return -1;
+    }
+}
+
+llm_backend_t llm_get_backend(void)
+{
+    return llm_backend;
+}
+
+const char *llm_backend_name(void)
+{
+    switch (llm_backend) {
+    case LLM_BACKEND_CPU:  return "cpu";
+    case LLM_BACKEND_CUDA: return "cuda";
+    case LLM_BACKEND_MLIR: return "mlir";
+    default:               return "unknown";
+    }
+}
+
 int llm_prompt(const char *user_text, char *output, int max_output)
 {
     if (!llm_is_loaded()) {
@@ -4430,9 +4716,9 @@ int llm_prompt(const char *user_text, char *output, int max_output)
     } else if (kstrlen(m->arch) >= 5 &&
                m->arch[0] == 'g' && m->arch[1] == 'e' &&
                m->arch[2] == 'm' && m->arch[3] == 'm' && m->arch[4] == 'a') {
-        PROMPT_APPEND("<start_of_turn>user\n");
+        PROMPT_APPEND("<turn|>user\n");
         PROMPT_APPEND(user_text);
-        PROMPT_APPEND("<end_of_turn>\n<start_of_turn>model\n");
+        PROMPT_APPEND("\n<turn|>model\n");
     } else {
         /* Generic / LLaMA / SmolLM — simple prompt */
         PROMPT_APPEND("User: ");
@@ -4443,7 +4729,15 @@ int llm_prompt(const char *user_text, char *output, int max_output)
     #undef PROMPT_APPEND
 
     /* Tokenize */
-    int n_tokens = llm_tokenize(m, prompt_buf, llm_tokens, llm_alloc_tokens - 64);
+    int n_tokens = llm_tokenize(m, prompt_buf, llm_tokens + 1, llm_alloc_tokens - 65);
+    /* Prepend BOS token */
+    if (n_tokens > 0 && m->bos_id >= 0) {
+        llm_tokens[0] = m->bos_id;
+        n_tokens++;
+    } else {
+        for (int i = 0; i < n_tokens; i++)
+            llm_tokens[i] = llm_tokens[i + 1];
+    }
     if (n_tokens <= 0) {
         __sync_lock_release(&llm_inference_active);
         kstrlcpy(output, "[tokenization failed]", max_output);
@@ -4482,7 +4776,7 @@ int llm_prompt_n(const char *user_text, char *output, int max_output, int max_to
     } while(0)
 
     /* Detect prompt format from architecture */
-    int is_phi3 = 0, is_phi2 = 0, is_chatml = 0;
+    int is_phi3 = 0, is_phi2 = 0, is_chatml = 0, is_gemma = 0;
     if (kstrlen(m->arch) >= 4 &&
         m->arch[0] == 'q' && m->arch[1] == 'w' &&
         m->arch[2] == 'e' && m->arch[3] == 'n')
@@ -4494,8 +4788,16 @@ int llm_prompt_n(const char *user_text, char *output, int max_output, int max_to
         else
             is_phi3 = 1;
     }
+    if (kstrlen(m->arch) >= 5 &&
+        m->arch[0] == 'g' && m->arch[1] == 'e' &&
+        m->arch[2] == 'm' && m->arch[3] == 'm' && m->arch[4] == 'a')
+        is_gemma = 1;
 
-    if (is_phi3) {
+    if (is_gemma) {
+        PA("<turn|>user\n");
+        PA(user_text);
+        PA("\n<turn|>model\n");
+    } else if (is_phi3) {
         PA("<|user|>\n");
         PA(user_text);
         PA("<|end|>\n<|assistant|>\n");
@@ -4513,7 +4815,16 @@ int llm_prompt_n(const char *user_text, char *output, int max_output, int max_to
     prompt_buf[pos] = '\0';
     #undef PA
 
-    int n_tokens = llm_tokenize(m, prompt_buf, llm_tokens, llm_alloc_tokens - 64);
+    int n_tokens = llm_tokenize(m, prompt_buf, llm_tokens + 1, llm_alloc_tokens - 65);
+    /* Prepend BOS token */
+    if (n_tokens > 0 && m->bos_id >= 0) {
+        llm_tokens[0] = m->bos_id;
+        n_tokens++;
+    } else {
+        /* No BOS: shift tokens to start of array */
+        for (int i = 0; i < n_tokens; i++)
+            llm_tokens[i] = llm_tokens[i + 1];
+    }
     if (n_tokens <= 0) {
         __sync_lock_release(&llm_inference_active);
         kstrlcpy(output, "[tokenization failed]", max_output);
@@ -4537,4 +4848,111 @@ void llm_reset_cache(void)
     if (kv_total > llm_alloc_kv_floats) kv_total = llm_alloc_kv_floats;
     kmemset(m->k_cache, 0, (uint64_t)kv_total * sizeof(float));
     kmemset(m->v_cache, 0, (uint64_t)kv_total * sizeof(float));
+}
+
+/* Reset chat KV context */
+void llm_chat_reset(void) { llm_reset_cache(); }
+
+/* How many KV positions are currently occupied */
+int llm_chat_context_tokens(void) {
+    if (!llm_is_loaded()) return 0;
+    return (int)llm_model.cache_len;
+}
+
+/* Maximum context window for the loaded model */
+int llm_chat_context_max(void) {
+    if (!llm_is_loaded()) return 0;
+    return (int)llm_model.max_seq;
+}
+
+/**
+ * Multi-turn chat: maintains KV cache across calls.
+ * Each call appends this user turn to the existing context.
+ * Call llm_chat_reset() to start a new conversation.
+ */
+int llm_chat_turn(const char *user_text, char *output, int max_output,
+                  int max_tokens, float temperature)
+{
+    if (!llm_is_loaded()) {
+        kstrlcpy(output, "[no model loaded]", max_output);
+        return -1;
+    }
+    if (__sync_lock_test_and_set(&llm_inference_active, 1)) {
+        kstrlcpy(output, "[inference busy]", max_output);
+        return -1;
+    }
+
+    llm_model_t *m = &llm_model;
+    int first_turn = (m->cache_len == 0);
+
+    /* Build only this turn's formatted prompt;
+     * previous turns are already baked into the KV cache. */
+    static char turn_buf[4096];
+    int pos = 0;
+    const int buf_max = (int)sizeof(turn_buf) - 1;
+    #define TA(s) do { \
+        const char *_s = (s); int _l = kstrlen(_s); \
+        if (pos + _l > buf_max) _l = buf_max - pos; \
+        if (_l > 0) { kmemcpy(turn_buf + pos, _s, _l); pos += _l; } \
+    } while(0)
+
+    int is_gemma = kstrlen(m->arch) >= 5 &&
+        m->arch[0]=='g' && m->arch[1]=='e' && m->arch[2]=='m' &&
+        m->arch[3]=='m' && m->arch[4]=='a';
+    int is_phi3 = kstrlen(m->arch) >= 3 &&
+        m->arch[0]=='p' && m->arch[1]=='h' && m->arch[2]=='i' &&
+        m->arch[3] != '2' && m->arch[3] != '\0';
+    int is_phi2 = kstrlen(m->arch) >= 3 &&
+        m->arch[0]=='p' && m->arch[1]=='h' && m->arch[2]=='i' &&
+        (m->arch[3] == '2' || m->arch[3] == '\0');
+    int is_chatml = kstrlen(m->arch) >= 4 &&
+        m->arch[0]=='q' && m->arch[1]=='w' && m->arch[2]=='e' && m->arch[3]=='n';
+
+    if (is_gemma) {
+        TA("<turn|>user\n");
+        TA(user_text);
+        TA("\n<turn|>model\n");
+    } else if (is_phi3) {
+        TA("<|user|>\n");
+        TA(user_text);
+        TA("<|end|>\n<|assistant|>\n");
+    } else if (is_phi2) {
+        TA("Instruct: ");
+        TA(user_text);
+        TA("\nOutput: ");
+    } else if (is_chatml) {
+        if (first_turn) {
+            TA("<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>\n");
+        }
+        TA("<|im_start|>user\n");
+        TA(user_text);
+        TA("<|im_end|>\n<|im_start|>assistant\n");
+    } else {
+        TA(user_text);
+        TA("\n");
+    }
+    turn_buf[pos] = '\0';
+    #undef TA
+
+    /* Tokenize: prepend BOS only on the first turn */
+    int n_tokens = llm_tokenize(m, turn_buf, llm_tokens + 1, llm_alloc_tokens - 65);
+    if (first_turn && m->bos_id >= 0) {
+        llm_tokens[0] = m->bos_id;
+        n_tokens++;
+    } else {
+        for (int i = 0; i < n_tokens; i++) llm_tokens[i] = llm_tokens[i + 1];
+    }
+
+    if (n_tokens <= 0) {
+        __sync_lock_release(&llm_inference_active);
+        kstrlcpy(output, "[tokenization failed]", max_output);
+        return -1;
+    }
+
+    if (max_tokens < 1) max_tokens = 256;
+    /* continue_cache=0 for first turn (resets KV cache), 1 for subsequent turns */
+    int n_gen = llm_generate(m, llm_tokens, n_tokens, output, max_output,
+                             max_tokens, temperature, first_turn ? 0 : 1);
+    __sync_lock_release(&llm_inference_active);
+    return n_gen;
 }
