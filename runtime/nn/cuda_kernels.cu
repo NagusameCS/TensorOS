@@ -17,8 +17,10 @@
 #include <stdint.h>
 #include <math.h>
 
-#define CUDA_KERNELS_EXPORTS
 #include "cuda_kernels.h"
+
+/* IEEE754 negative infinity for CUDA device code */
+#define NEG_INF __int_as_float(0xFF800000)
 
 /* ═══════════════════════════════════════════════════════════════════════
  * Helpers
@@ -84,7 +86,7 @@ __device__ float block_reduce_max(float val, float *shared) {
     __syncthreads();
 
     int n_warps = (blockDim.x + 31) >> 5;
-    val = (threadIdx.x < n_warps) ? shared[threadIdx.x] : -INFINITY;
+    val = (threadIdx.x < n_warps) ? shared[threadIdx.x] : NEG_INF;
     if (warp_id == 0) val = warp_reduce_max(val);
     return val;
 }
@@ -287,7 +289,7 @@ __global__ void kernel_softmax(float *x, int n) {
     __shared__ float smem[32];
 
     /* Pass 1: find max */
-    float max_val = -INFINITY;
+    float max_val = NEG_INF;
     for (int i = threadIdx.x; i < n; i += blockDim.x)
         max_val = fmaxf(max_val, x[i]);
     max_val = block_reduce_max(max_val, smem);
@@ -494,7 +496,7 @@ __global__ void kernel_attention(
 
     /* Phase 2: Softmax over scores */
     /* Find max */
-    float max_val = -INFINITY;
+    float max_val = NEG_INF;
     for (int t = threadIdx.x; t < seq_len; t += blockDim.x)
         max_val = fmaxf(max_val, scores[t]);
     max_val = block_reduce_max(max_val, smem);
