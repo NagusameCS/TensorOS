@@ -1,0 +1,4 @@
+# prompt|must_contain
+What is 2+2?|4
+Name one benefit of unit tests.|test
+Explain CPU cache in one sentence.|cache
