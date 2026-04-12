@@ -285,4 +285,8 @@ int llm_test_tokenize(const char *text, int text_len, int *tokens, int max_token
 /** Decode a token ID into text. Returns byte length. */
 int llm_test_decode_token(int token_id, char *buf, int max_len);
 
+/* ── Tensor Bridge API (hidden-state injection / daisy-chaining) ─── */
+#include "runtime/nn/tensor_bridge.h"
+tensor_bridge_t *llm_get_bridge(void);
+
 #endif /* TENSOROS_LLM_H */

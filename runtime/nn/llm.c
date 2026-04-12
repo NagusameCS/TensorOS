@@ -20,6 +20,7 @@
 #include "runtime/nn/llm.h"
 #include "runtime/nn/backend.h"
 #include "runtime/nn/model_meta.h"
+#include "runtime/nn/tensor_bridge.h"
 #include "kernel/core/kernel.h"
 #include "kernel/mm/tensor_mm.h"
 #include "kernel/core/perf.h"
@@ -64,6 +65,9 @@ typedef void (*llm_token_cb_t)(const char *text, int len, void *userdata);
 static llm_token_cb_t llm_stream_cb   = (llm_token_cb_t)0;
 static void          *llm_stream_cb_ud = (void *)0;
 static llm_backend_t  llm_backend      = LLM_BACKEND_CPU;
+
+/* Tensor bridge for hidden-state injection / daisy-chaining */
+static tensor_bridge_t llm_bridge;
 
 void llm_set_stream_cb(llm_token_cb_t cb, void *userdata) {
     llm_stream_cb    = cb;
@@ -2623,6 +2627,13 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
     for (int L = 0; L < m->n_layers; L++) {
         llm_layer_t *layer = &m->layers[L];
 
+        /* Bridge: inject hidden state before this layer */
+        if (llm_bridge.mode & BRIDGE_MODE_INJECT) {
+            int inj_layer = llm_bridge.inject_layer < 0 ? 0 : llm_bridge.inject_layer;
+            if (L == inj_layer)
+                tensor_bridge_inject(&llm_bridge, llm_x, dim, pos);
+        }
+
         /* === Self-Attention === */
 
         /* 2a. Pre-attention norm (LayerNorm for Phi-2, RMSNorm for others) */
@@ -2872,6 +2883,13 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
             float s = ((const float *)layer->iswa_out_scale)[0];
             for (int i = 0; i < dim; i++)
                 llm_x[i] *= s;
+        }
+
+        /* Bridge: capture hidden state after this layer */
+        if (llm_bridge.mode & BRIDGE_MODE_CAPTURE) {
+            int cap_layer = llm_bridge.capture_layer < 0 ? m->n_layers - 1 : llm_bridge.capture_layer;
+            if (L == cap_layer)
+                tensor_bridge_capture(&llm_bridge, llm_x, dim, pos);
         }
     }
 
@@ -5004,6 +5022,14 @@ int llm_chat_turn(const char *user_text, char *output, int max_output,
                              max_tokens, temperature, first_turn ? 0 : 1);
     __sync_lock_release(&llm_inference_active);
     return n_gen;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  Tensor Bridge API (exposes bridge for daisy-chaining LLMs)                */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+tensor_bridge_t *llm_get_bridge(void) {
+    return &llm_bridge;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
