@@ -663,6 +663,66 @@ __global__ void kernel_gemm(
 #define TYPE_F16  1
 #define TYPE_Q4_0 2
 #define TYPE_Q8_0 8
+#define TYPE_Q6_K 14
+
+/* Q6_K super-block: 256 elements, 210 bytes */
+struct q6_k_block {
+    uint8_t ql[128];    /* lower 4 bits of quants */
+    uint8_t qh[64];     /* upper 2 bits of quants */
+    int8_t  scales[16]; /* 16 sub-block scales */
+    uint16_t d;         /* FP16 super-block scale */
+};
+
+/* GEMV for Q6_K: each super-block = 256 elements, 210 bytes */
+__global__ void kernel_gemv_q6_k(
+    float       *out,
+    const void  *W,
+    const float *x,
+    int          out_dim,
+    int          in_dim)
+{
+    int row = blockIdx.x;
+    if (row >= out_dim) return;
+
+    int n_sb = in_dim / 256;  /* super-blocks per row */
+    /* Q6_K row size: n_sb * 210 bytes */
+    const uint8_t *row_base = (const uint8_t *)W + (int64_t)row * n_sb * 210;
+
+    float sum = 0.0f;
+
+    for (int sb = threadIdx.x; sb < n_sb; sb += blockDim.x) {
+        const struct q6_k_block *b = (const struct q6_k_block *)(row_base + sb * 210);
+        float d_val = fp16_to_f32(b->d);
+        const float *xp = x + sb * 256;
+
+        float local = 0.0f;
+        for (int half = 0; half < 2; half++) {
+            const uint8_t *ql_h = b->ql + half * 64;
+            const uint8_t *qh_h = b->qh + half * 32;
+            const int8_t *sc_h = b->scales + half * 8;
+            for (int l = 0; l < 32; l++) {
+                int q0 = (int)(ql_h[l] & 0xF)       | (int)(((qh_h[l] >> 0) & 3) << 4);
+                int q1 = (int)(ql_h[l + 32] & 0xF)   | (int)(((qh_h[l] >> 2) & 3) << 4);
+                int q2 = (int)(ql_h[l] >> 4)          | (int)(((qh_h[l] >> 4) & 3) << 4);
+                int q3 = (int)(ql_h[l + 32] >> 4)     | (int)(((qh_h[l] >> 6) & 3) << 4);
+                int si = l / 16;
+                float s0 = d_val * (float)sc_h[0 + si];
+                float s1 = d_val * (float)sc_h[2 + si];
+                float s2 = d_val * (float)sc_h[4 + si];
+                float s3 = d_val * (float)sc_h[6 + si];
+                local += s0 * (float)(q0 - 32) * xp[half*128 + l];
+                local += s1 * (float)(q1 - 32) * xp[half*128 + l + 32];
+                local += s2 * (float)(q2 - 32) * xp[half*128 + l + 64];
+                local += s3 * (float)(q3 - 32) * xp[half*128 + l + 96];
+            }
+        }
+        sum += local;
+    }
+
+    __shared__ float smem[32];
+    sum = block_reduce_sum(sum, smem);
+    if (threadIdx.x == 0) out[row] = sum;
+}
 
 extern "C" {
 
@@ -721,7 +781,21 @@ CUDA_API void ck_sync(void) {
 
 CUDA_API void ck_gemv(float *out, const void *W, const float *x,
                       int out_dim, int in_dim, int type_id) {
-    int threads = 256;
+    /* Adaptive thread count: match work per block to avoid idle threads.
+     * For quantized types, work items = number of quant blocks per row.
+     * Round up to nearest warp (32) for efficient execution. */
+    int work_items;
+    switch (type_id) {
+        case TYPE_Q4_0: work_items = in_dim / 32; break;
+        case TYPE_Q8_0: work_items = in_dim / 32; break;
+        case TYPE_Q6_K: work_items = in_dim / 256; break;
+        case TYPE_F16:  work_items = in_dim; break;
+        default:        work_items = in_dim; break;
+    }
+    int threads = ((work_items + 31) / 32) * 32;  /* round up to warp */
+    if (threads < 32) threads = 32;
+    if (threads > 256) threads = 256;
+
     switch (type_id) {
         case TYPE_Q4_0:
             kernel_gemv_q4_0<<<out_dim, threads>>>(out, W, x, out_dim, in_dim);
@@ -734,6 +808,9 @@ CUDA_API void ck_gemv(float *out, const void *W, const float *x,
             break;
         case TYPE_F16:
             kernel_gemv_f16<<<out_dim, threads>>>(out, (const __half *)W, x, out_dim, in_dim);
+            break;
+        case TYPE_Q6_K:
+            kernel_gemv_q6_k<<<out_dim, threads>>>(out, W, x, out_dim, in_dim);
             break;
         default:
             break;

@@ -107,6 +107,167 @@ static int llm_alloc_vocab;
 static int llm_alloc_tokens;
 static int llm_alloc_kv_floats;
 
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  GPU Weight Offload (CUDA)                                                  */
+/*                                                                             */
+/*  Pre-uploads all weight matrices to GPU VRAM at model load time.            */
+/*  During inference, llm_gemv() intercepts calls and dispatches to CUDA       */
+/*  GEMV when a GPU copy of the weight exists.                                 */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+#ifdef ENABLE_CUDA
+
+#define GPU_WEIGHT_MAP_MAX 512
+
+typedef struct {
+    const void *host_ptr;   /* mmap'd host weight pointer (lookup key) */
+    void       *dev_ptr;    /* GPU device pointer */
+    uint64_t    size;       /* Tensor size in bytes */
+} gpu_weight_entry_t;
+
+static struct {
+    int active;                            /* 1 if GPU offload is live */
+    gpu_weight_entry_t map[GPU_WEIGHT_MAP_MAX];
+    int map_count;
+    float *d_x;                            /* Device input scratch */
+    float *d_out;                          /* Device output scratch */
+    int max_in_dim;
+    int max_out_dim;
+} gpu_ctx;
+
+/* Look up device pointer for a host weight pointer */
+static void *llm_gpu_lookup(const void *host_ptr) {
+    for (int i = 0; i < gpu_ctx.map_count; i++) {
+        if (gpu_ctx.map[i].host_ptr == host_ptr)
+            return gpu_ctx.map[i].dev_ptr;
+    }
+    return (void *)0;
+}
+
+/* Upload one weight tensor to GPU and register in the map */
+static int llm_gpu_register_weight(const void *host, uint64_t size) {
+    if (!host || size == 0) return 0;
+    if (gpu_ctx.map_count >= GPU_WEIGHT_MAP_MAX) return -1;
+    const backend_t *be = backend_get_by_id(BACKEND_CUDA);
+    if (!be) return -1;
+
+    void *dev = be->mem.alloc(size);
+    if (!dev) return -2;
+    be->mem.upload(dev, host, size);
+
+    gpu_ctx.map[gpu_ctx.map_count].host_ptr = host;
+    gpu_ctx.map[gpu_ctx.map_count].dev_ptr  = dev;
+    gpu_ctx.map[gpu_ctx.map_count].size     = size;
+    gpu_ctx.map_count++;
+    return 0;
+}
+
+/* Upload a weight matrix: out_dim rows, each llm_row_bytes(in_dim, type) */
+static int llm_gpu_upload_weight_mat(const void *weight, int out_dim, int in_dim,
+                                     ggml_type_t type) {
+    if (!weight) return 0;
+    /* Only upload types the CUDA GEMV kernel can handle */
+    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q8_0 &&
+        type != GGML_TYPE_F32  && type != GGML_TYPE_F16  &&
+        type != GGML_TYPE_Q6_K)
+        return 0;
+    uint64_t rb = llm_row_bytes(in_dim, type);
+    uint64_t size = (uint64_t)out_dim * rb;
+    return llm_gpu_register_weight(weight, size);
+}
+
+/* Upload all model weights to GPU. Called after model load if CUDA available. */
+static int llm_gpu_init(llm_model_t *m) {
+    const backend_t *be = backend_get_by_id(BACKEND_CUDA);
+    if (!be) return -1;
+
+    kmemset(&gpu_ctx, 0, sizeof(gpu_ctx));
+
+    int dim = m->dim;
+    int hd  = m->head_dim;
+    int n_heads = m->n_heads;
+    int n_kv = m->n_kv_heads;
+    int ff = m->ff_dim;
+    for (int i = 0; i < m->n_layers; i++)
+        if (m->layers[i].ff_dim_layer > ff) ff = m->layers[i].ff_dim_layer;
+
+    int q_dim  = n_heads * hd;
+    int kv_dim = n_kv * hd;
+
+    /* Compute max input/output dimensions for scratch buffers */
+    gpu_ctx.max_in_dim = dim > ff ? dim : ff;
+    if (q_dim > gpu_ctx.max_in_dim) gpu_ctx.max_in_dim = q_dim;
+    gpu_ctx.max_out_dim = m->vocab_size;
+    if (q_dim > gpu_ctx.max_out_dim) gpu_ctx.max_out_dim = q_dim;
+    if (ff > gpu_ctx.max_out_dim) gpu_ctx.max_out_dim = ff;
+
+    /* Check if model fits in GPU memory (leave 256 MB headroom) */
+    uint64_t free_mem = be->get_free_memory(0);
+    uint64_t scratch_bytes = (uint64_t)(gpu_ctx.max_in_dim + gpu_ctx.max_out_dim) * sizeof(float);
+    kprintf("[GPU] VRAM free: %llu MB, scratch: %llu KB\n",
+            (unsigned long long)(free_mem / (1024 * 1024)),
+            (unsigned long long)(scratch_bytes / 1024));
+
+    /* Allocate GPU scratch buffers */
+    gpu_ctx.d_x   = (float *)be->mem.alloc((uint64_t)gpu_ctx.max_in_dim * sizeof(float));
+    gpu_ctx.d_out  = (float *)be->mem.alloc((uint64_t)gpu_ctx.max_out_dim * sizeof(float));
+    if (!gpu_ctx.d_x || !gpu_ctx.d_out) {
+        kprintf("[GPU] Failed to allocate scratch buffers\n");
+        return -1;
+    }
+
+    /* Upload per-layer weights */
+    for (int L = 0; L < m->n_layers; L++) {
+        llm_layer_t *layer = &m->layers[L];
+        int lhd     = layer->head_dim_layer ? layer->head_dim_layer : hd;
+        int lq_dim  = n_heads * lhd;
+        int lkv_dim = n_kv * lhd;
+        int lff     = layer->ff_dim_layer ? layer->ff_dim_layer : ff;
+
+        llm_gpu_upload_weight_mat(layer->q_weight, lq_dim, dim, layer->q_type);
+        if (layer->kv_reuse_layer < 0) {
+            llm_gpu_upload_weight_mat(layer->k_weight, lkv_dim, dim, layer->k_type);
+            llm_gpu_upload_weight_mat(layer->v_weight, lkv_dim, dim, layer->v_type);
+        }
+        llm_gpu_upload_weight_mat(layer->o_weight, dim, lq_dim, layer->o_type);
+        if (layer->ffn_gate)
+            llm_gpu_upload_weight_mat(layer->ffn_gate, lff, dim, layer->gate_type);
+        llm_gpu_upload_weight_mat(layer->ffn_up,   lff, dim, layer->up_type);
+        llm_gpu_upload_weight_mat(layer->ffn_down, dim, lff, layer->down_type);
+
+        /* ISWA injection weights (Gemma4) */
+        if (layer->iswa_inp_gate)
+            llm_gpu_upload_weight_mat(layer->iswa_inp_gate, m->iswa_n_embd,
+                                      dim, layer->iswa_inp_gate_type);
+        if (layer->iswa_proj)
+            llm_gpu_upload_weight_mat(layer->iswa_proj, dim, m->iswa_n_embd,
+                                      layer->iswa_proj_type);
+    }
+
+    /* Upload global weights */
+    llm_gpu_upload_weight_mat(m->token_embd, m->vocab_size, dim, m->token_embd_type);
+    if (m->output_weight)
+        llm_gpu_upload_weight_mat(m->output_weight, m->vocab_size, dim, m->output_type);
+    if (m->iswa_model_proj)
+        llm_gpu_upload_weight_mat(m->iswa_model_proj,
+                                  m->iswa_n_embd * m->n_layers, dim,
+                                  m->iswa_model_proj_type);
+
+    be->mem.sync();
+
+    /* Report total uploaded */
+    uint64_t total = 0;
+    for (int i = 0; i < gpu_ctx.map_count; i++)
+        total += gpu_ctx.map[i].size;
+
+    gpu_ctx.active = 1;
+    kprintf("[GPU] Uploaded %d weight tensors (%llu MB) to VRAM\n",
+            gpu_ctx.map_count, (unsigned long long)(total / (1024 * 1024)));
+    return 0;
+}
+
+#endif /* ENABLE_CUDA */
+
 /* Allocate all inference scratch buffers from the tensor heap.
  * Called once after the model's dimensions are known. */
 static int llm_alloc_scratch(const llm_model_t *m)
@@ -1687,6 +1848,29 @@ static void gemv_worker_avx2(void *arg)
 static void llm_gemv(float *out, const void *weight, const float *x,
                      int out_dim, int in_dim, ggml_type_t type)
 {
+#ifdef ENABLE_CUDA
+    /* GPU-accelerated GEMV: look up pre-uploaded device weight.
+     * Only dispatch to CUDA for types the GPU kernels support.
+     * Size threshold: GPU overhead only pays off for large matrices. */
+    if (gpu_ctx.active && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 ||
+                           type == GGML_TYPE_F32  || type == GGML_TYPE_F16  ||
+                           type == GGML_TYPE_Q6_K) &&
+        out_dim >= 8192) {
+        void *d_weight = llm_gpu_lookup(weight);
+        if (d_weight) {
+            const backend_t *be = backend_get_by_id(BACKEND_CUDA);
+            /* Upload input vector to GPU scratch */
+            be->mem.upload(gpu_ctx.d_x, x, (uint64_t)in_dim * sizeof(float));
+            /* Launch CUDA GEMV kernel */
+            be->compute.gemv(gpu_ctx.d_out, d_weight, gpu_ctx.d_x,
+                             out_dim, in_dim, type);
+            /* Download result (cudaMemcpy D2H is synchronous — waits for kernel) */
+            be->mem.download(out, gpu_ctx.d_out, (uint64_t)out_dim * sizeof(float));
+            return;
+        }
+    }
+#endif
+
 #ifndef __aarch64__
     /* JIT AVX2+FMA GEMV: best single-core Q8_0 performance */
     if (cpu_features.avx2_usable && type == GGML_TYPE_Q8_0) {
@@ -4310,7 +4494,23 @@ static int llm_init_parsed_model(llm_model_t *m)
 
     /* Initialize backend registry (CPU always, CUDA/MLIR if compiled) */
     backend_init_all();
+
+#ifdef ENABLE_CUDA
+    /* Auto-select CUDA and upload weights to GPU if available */
+    if (backend_get_by_id(BACKEND_CUDA) && backend_set(BACKEND_CUDA) == 0) {
+        if (llm_gpu_init(m) == 0) {
+            kprintf("[LLM] Backend: cuda (GPU-accelerated)\n");
+        } else {
+            /* GPU upload failed — fall back to CPU */
+            backend_set(BACKEND_CPU);
+            kprintf("[LLM] Backend: cpu (GPU upload failed, using CPU fallback)\n");
+        }
+    } else {
+        kprintf("[LLM] Backend: %s\n", backend_get()->name);
+    }
+#else
     kprintf("[LLM] Backend: %s\n", backend_get()->name);
+#endif
 
     return 0;
 }
