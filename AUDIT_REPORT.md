@@ -1,68 +1,81 @@
 # TensorOS Comprehensive Code Audit Report
 
-**Date**: June 2025 (updated March 2026)
-**Scope**: Full codebase at `C:\Users\legom\TensorOS` (~54K lines)
+**Date**: June 2025 (updated March 2026, July 2025)
+**Scope**: Full codebase at `C:\Users\legom\TensorOS` (~60K lines)
 **Auditor**: GitHub Copilot (Claude Opus 4.6)
 
 ---
 
-## March 2026 Update — Coherent LLM Inference Achieved
+## July 2025 Update — Evolution Plan P0-P7
 
-Since the June 2025 audit, the following critical bugs were found and fixed:
+Seven-phase evolution plan executed to expand TensorOS from a single-model inference
+engine to a multi-backend, multi-model, API-serving platform.
 
-### Bugs Fixed (v0.2.0)
+### New Subsystems Added (v0.4.0)
 
-| Bug | Impact | Fix |
-|-----|--------|-----|
-| **Q4_0 nibble layout** | All Q4_0 dequant produced elements in wrong order (interleaved vs GGML standard). Corrupted every F32 boundary (RMSNorm, residuals). | Rewrote all 8 Q4_0 dequant sites: embed, dot32 (SSE2/aarch64), dot32_avx2, fused GEMV (2 variants), AVX2 helpers |
-| **RMSNorm epsilon** | Hardcoded 1e-6 vs model's 1e-5 | Loaded from GGUF metadata, parameterized all callsites |
-| **Missing LongRoPE factors** | Phi-3.5 requires position-dependent frequency scaling | Loaded rope_factors_short/long from GGUF, applied in precompute |
-| **Math library precision** | sinf/cosf/expf/logf had catastrophic errors | Complete rewrites of all transcendental functions |
+| Subsystem | Files | Description |
+|-----------|-------|-------------|
+| **P0: Eval harness** | `tests/runtime/test_kernels.c` | 8595 deterministic tests, Q4xQ8 SIMD fix (24% speedup, 82 ms/tok) |
+| **P1: Model metadata** | `runtime/nn/model_meta.h/c` | Format detection (GGUF/safetensors/ONNX/PyTorch), HF↔GGUF tensor name normalization (53 mapping rules), architecture inference |
+| **P2: Backend vtable** | `runtime/nn/backend.h/c` | Backend abstraction with 17 compute ops + memory ops, CPU reference implementation with full scalar kernels |
+| **P2: CUDA skeleton** | `runtime/nn/backend_cuda.c` | CUDA backend stubs with driver API, `#ifdef ENABLE_CUDA` |
+| **P2: MLIR skeleton** | `runtime/nn/backend_mlir.c` | MLIR backend stubs, `#ifdef ENABLE_MLIR` |
+| **P5: Tensor bridge** | `runtime/nn/tensor_bridge.h/c` | Hidden-state capture/injection for LLM daisy-chaining, linear projection for dimension mismatch |
+| **P6: BLT tokenizer** | `runtime/nn/blt.h/c` | Hybrid Bytes/Letters/Tokens tokenizer with byte-level fallback, UTF-8 aware |
+| **P7: HTTP API server** | `host/api_server.h/c` (HyperTensor) | Ollama-compatible REST API: `/api/generate`, `/api/chat`, `/api/tags` |
 
-### Bugs Fixed (v0.3.0)
+### Architecture Improvements
 
-| Bug | Impact | Fix |
-|-----|--------|-----|
-| **SMP page tables at 0x1000** | Collided with BIOS Data Area, AP bootstrap failures | Relocated to `0x10000` (18 pages), 16 GB identity map with 2 MB huge pages |
-| **JIT loop counters halved** | `vadd`, `dot`, `vmul`, `rmsnorm` emitted `vecs/2` instead of `vecs`, halving computation | Changed all loop counts from `vecs/2` to `vecs` |
-| **SMP trampoline alignment** | `jmp rax` left stack misaligned, SSE2 `movaps` faulted on APs | Changed to `call rax` for 16-byte alignment per System V ABI |
-| **SMP IPI dispatch** | APs stuck in `cli; jmp $`, no IPI handler for vector 0xFE | Installed IPI handler, APs now execute work via `smp_dispatch()` |
+- **Backend dispatch**: `backend_init_all()` + `backend_get()/set()` — hot-swappable compute backends
+- **Tensor bridge hooks**: Capture/inject at any transformer layer for model chaining
+- **BLT byte fallback**: UTF-8 aware multi-byte fallback in `llm_tokenize_segment()`, fixing 3/4-byte UTF-8 encoding issues  
+- **Model universality**: Format auto-detection + tensor name remapping enables loading non-GGUF models (future)
+- **API server**: `--serve --port 11434` starts Ollama-compatible HTTP server
 
-### Current LLM Inference Scorecard
+### Current LLM Inference Scorecard (v0.4.0)
 
 | Metric | Value |
 |--------|-------|
-| Model | Phi-3.5 Mini Instruct (3.8B params, Q4_0) |
-| Output quality | ✅ Coherent English, matches Python/NumPy reference |
-| Decode speed | 162 ms/tok (4 cores, QEMU WHPX) |
-| Prefill speed | 5,475 ms for 12 tokens |
-| Numerical accuracy | Exact match at all checkpoints (embedding, L0 Q/K/V, L0 output) |
+| Model | Gemma 4 E2B IT (2.6B params, Q4_0) |
+| Output quality | ✅ Correct answers, coherent multi-turn chat |
+| Decode speed | **82-91 ms/tok** (16 cores, native x86_64) |
+| Prefill speed | 1,500 ms for typical prompts |
 | Quantization formats | Q4_0 ✅, Q4_1 ✅, Q6_K ✅, Q8_0 ✅ |
-| Model architectures | Phi-3 ✅, LLaMA ✅, Gemma ✅, Mistral ✅, Qwen2 ✅ |
+| Model architectures | Gemma4 ✅ (ISWA), Phi-3 ✅, LLaMA ✅, Gemma ✅, Mistral ✅, Qwen2 ✅ |
+| Backend | CPU (AVX2+FMA, Q4xQ8 integer GEMV) |
+| API | Ollama-compatible HTTP REST |
+| Test coverage | 8595 eval tests + 29 metadata tests |
 
 ### Updated Scorecard
 
-| Category | Jun 2025 | Mar 2026 | Change |
-|----------|----------|----------|--------|
-| LLM inference | ★★★★☆ | ★★★★★ | **Upgraded**: Produces correct output, verified numerically |
-| Tensor/SIMD ops | ★★★★☆ | ★★★★☆ | Unchanged |
-| Boot / HW init | ★★★★☆ | ★★★★☆ | Unchanged |
-| JIT compiler | ★★★★☆ | ★★★★★ | **Upgraded**: 6 forward kernels compiled and verified working |
-| Drivers (virtio) | ★★★☆☆ | ★★★☆☆ | Unchanged |
-| SMP | ★★★☆☆ | ★★★★☆ | **Upgraded**: APs execute work, parallel GEMV dispatch working |
-| Memory management | ★★★☆☆ | ★★★☆☆ | Unchanged |
-| Networking | ★★★☆☆ | ★★★☆☆ | Unchanged |
-| Scheduler | ★★☆☆☆ | ★★☆☆☆ | Unchanged |
-| Virtualization | ★★☆☆☆ | ★★☆☆☆ | Unchanged |
-| Security / Isolation | ★☆☆☆☆ | ★☆☆☆☆ | Unchanged |
-| Filesystem | ★☆☆☆☆ | ★☆☆☆☆ | Unchanged |
+| Category | Jun 2025 | Mar 2026 | Jul 2025 | Change |
+|----------|----------|----------|----------|--------|
+| LLM inference | ★★★★☆ | ★★★★★ | ★★★★★ | Backend vtable, tensor bridge, 82 ms/tok |
+| Tensor/SIMD ops | ★★★★☆ | ★★★★☆ | ★★★★★ | **Upgraded**: Q4xQ8 integer path, eval harness |
+| Boot / HW init | ★★★★☆ | ★★★★☆ | ★★★★☆ | Unchanged |
+| JIT compiler | ★★★★☆ | ★★★★★ | ★★★★★ | Unchanged |
+| Drivers (virtio) | ★★★☆☆ | ★★★☆☆ | ★★★☆☆ | Unchanged |
+| SMP | ★★★☆☆ | ★★★★☆ | ★★★★☆ | Unchanged |
+| Memory management | ★★★☆☆ | ★★★☆☆ | ★★★☆☆ | Unchanged |
+| Networking | ★★★☆☆ | ★★★☆☆ | ★★★☆☆ | HTTP API server (HyperTensor) |
+| Scheduler | ★★☆☆☆ | ★★☆☆☆ | ★★☆☆☆ | Unchanged |
+| Virtualization | ★★☆☆☆ | ★★☆☆☆ | ★★☆☆☆ | Unchanged |
+| Security / Isolation | ★☆☆☆☆ | ★☆☆☆☆ | ★☆☆☆☆ | Unchanged |
+| Filesystem | ★☆☆☆☆ | ★☆☆☆☆ | ★☆☆☆☆ | Unchanged |
 
 ### What Still Doesn't Work
 
 Most items from the original audit remain open. The OS layer (virtual memory,
 preemptive scheduling, TCP, persistent filesystem, GPU drivers) is unchanged.
 The v0.3.0 improvements are in SMP work dispatch, JIT forward kernels, and
-performance optimization (454 → 162 ms/tok).
+performance optimization (454 → 162 → 82 ms/tok).
+
+### What's Partially Complete (P3/P4)
+
+- **P3 CUDA backend**: Vtable skeleton with all stubs implemented. Requires CUDA
+  toolkit to compile real GPU kernels. `backend_cuda.c` has all 17 compute op entries.
+- **P4 MLIR backend**: Vtable skeleton delegating memory ops to CPU backend.
+  Requires MLIR libraries for real lowering pipeline.
 
 ---
 

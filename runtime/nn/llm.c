@@ -21,6 +21,7 @@
 #include "runtime/nn/backend.h"
 #include "runtime/nn/model_meta.h"
 #include "runtime/nn/tensor_bridge.h"
+#include "runtime/nn/blt.h"
 #include "kernel/core/kernel.h"
 #include "kernel/mm/tensor_mm.h"
 #include "kernel/core/perf.h"
@@ -3211,17 +3212,29 @@ static int llm_tokenize_segment(const llm_model_t *m, const char *text, int text
             tokens[n++] = best_id;
             pos += best_len;
         } else {
+            /* BLT-enhanced byte fallback: handle full UTF-8 sequences */
             uint8_t b0 = (uint8_t)enc_buf[pos];
-            if (b0 >= 0xC0 && b0 < 0xE0 && pos + 1 < enc_len) {
-                int id = llm_find_token(m, enc_buf + pos, 2);
-                if (id >= 0) { tokens[n++] = id; pos += 2; continue; }
+            int utf8_len = 1;
+            if      (b0 >= 0xF0 && pos + 3 < enc_len) utf8_len = 4;
+            else if (b0 >= 0xE0 && pos + 2 < enc_len) utf8_len = 3;
+            else if (b0 >= 0xC0 && pos + 1 < enc_len) utf8_len = 2;
+
+            /* Try multi-byte token match first (e.g. ▁, kanji, emoji) */
+            if (utf8_len > 1) {
+                int id = llm_find_token(m, enc_buf + pos, utf8_len);
+                if (id >= 0) { tokens[n++] = id; pos += utf8_len; continue; }
             }
-            if (m->byte_tokens[b0] >= 0) {
-                tokens[n++] = m->byte_tokens[b0];
-            } else {
-                tokens[n++] = 0;
+
+            /* Emit each byte of the UTF-8 sequence as individual byte tokens */
+            for (int bi = 0; bi < utf8_len && n < max_tokens; bi++) {
+                uint8_t bv = (uint8_t)enc_buf[pos + bi];
+                if (m->byte_tokens[bv] >= 0) {
+                    tokens[n++] = m->byte_tokens[bv];
+                } else {
+                    tokens[n++] = 0; /* UNK */
+                }
             }
-            pos++;
+            pos += utf8_len;
         }
     }
 
