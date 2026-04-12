@@ -18,6 +18,8 @@
  * =============================================================================*/
 
 #include "runtime/nn/llm.h"
+#include "runtime/nn/backend.h"
+#include "runtime/nn/model_meta.h"
 #include "kernel/core/kernel.h"
 #include "kernel/mm/tensor_mm.h"
 #include "kernel/core/perf.h"
@@ -4011,14 +4013,19 @@ int llm_load_from_buffer(void *data, uint64_t size)
         kprintf("[LLM] Invalid buffer (ptr=%p, size=%lu)\n", data, (unsigned long)size);
         return -1;
     }
-    uint32_t magic = (uint32_t)((uint8_t *)data)[0] |
-                     ((uint32_t)((uint8_t *)data)[1] << 8) |
-                     ((uint32_t)((uint8_t *)data)[2] << 16) |
-                     ((uint32_t)((uint8_t *)data)[3] << 24);
-    if (magic != GGUF_MAGIC) {
-        kprintf("[LLM] Not a GGUF file (magic=0x%08x)\n", magic);
+
+    model_format_t fmt = model_detect_format(data, size);
+    if (fmt == MODEL_FMT_UNKNOWN) {
+        kprintf("[LLM] Unrecognized model format\n");
         return -1;
     }
+    if (fmt != MODEL_FMT_GGUF) {
+        static const char *fmt_names[] = {"unknown","gguf","safetensors","onnx","pytorch"};
+        kprintf("[LLM] Detected format: %s (not yet supported for inference, use GGUF)\n",
+                fmt_names[fmt]);
+        return -1;
+    }
+
     kmemset(&llm_model, 0, sizeof(llm_model));
     llm_model.data_buf = data;
     llm_model.data_size = size;
@@ -4269,6 +4276,10 @@ static int llm_init_parsed_model(llm_model_t *m)
     m->cache_len = 0;
 
     kprintf("[LLM] Model loaded successfully! Ready for inference.\n");
+
+    /* Initialize backend registry (CPU always, CUDA/MLIR if compiled) */
+    backend_init_all();
+    kprintf("[LLM] Backend: %s\n", backend_get()->name);
 
     return 0;
 }
