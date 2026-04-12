@@ -109,6 +109,25 @@ function Download-ModelFile([string]$SourceUrl, [string]$TargetPath) {
     Write-Host "Done: $([math]::Round($sz / 1MB)) MB" -ForegroundColor Green
 }
 
+function Write-ModelManifest([string]$ModelPath, [string]$SourceRef, [string]$Kind) {
+    if (-not (Test-Path $ModelPath)) { return }
+    $item = Get-Item $ModelPath
+    $manifest = [ordered]@{
+        schema_version = 1
+        created_utc = (Get-Date).ToUniversalTime().ToString("o")
+        source_ref = $SourceRef
+        source_kind = $Kind
+        file_name = $item.Name
+        file_path = $item.FullName
+        size_bytes = [int64]$item.Length
+        format = if ($item.Extension.ToLower() -eq ".gguf") { "gguf" } elseif ($item.Extension.ToLower() -eq ".safetensors") { "safetensors" } else { "unknown" }
+    }
+    $json = $manifest | ConvertTo-Json -Depth 4
+    $manifestPath = "$ModelPath.manifest.json"
+    Set-Content -Path $manifestPath -Value $json -Encoding UTF8
+    Write-Host "Manifest: $manifestPath" -ForegroundColor DarkGray
+}
+
 function Import-OllamaModel([string]$Tag) {
     if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
         throw "Ollama CLI not found in PATH. Install Ollama or pass a Hugging Face GGUF URL/repo."
@@ -189,6 +208,7 @@ if ($Ref) {
                 $Output = Join-Path $ModelsDir $hf.File
             }
             Download-ModelFile -SourceUrl $hf.Url -TargetPath $Output
+            Write-ModelManifest -ModelPath $Output -SourceRef $Ref -Kind "hf"
             exit 0
         }
 
@@ -222,6 +242,7 @@ if (-not $Registry.ContainsKey($key)) {
                 $Output = Join-Path $ModelsDir $hf.File
             }
             Download-ModelFile -SourceUrl $hf.Url -TargetPath $Output
+            Write-ModelManifest -ModelPath $Output -SourceRef $Model -Kind "hf"
             exit 0
         }
 
@@ -258,6 +279,7 @@ Write-Host ""
 try {
     $ProgressPreference = 'SilentlyContinue'  # Speed up download
     Download-ModelFile -SourceUrl $info.Url -TargetPath $target
+    Write-ModelManifest -ModelPath $target -SourceRef $info.Url -Kind "registry"
     $sz = (Get-Item $target).Length
     Write-Host "`n=== Download complete: $([math]::Round($sz / 1MB)) MB ===" -ForegroundColor Green
     Write-Host "  Run: .\build.ps1 -Run" -ForegroundColor Yellow
