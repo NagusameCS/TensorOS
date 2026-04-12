@@ -1953,9 +1953,9 @@ static void emit_q4q8_row_block(jit_buf_t *b, int ymm_iacc, int ymm_facc)
 
     /* Now YMM0 = 32 unsigned Q4 nibbles [lo0..lo15, hi0..hi15] */
 
-    /* Load 32 Q8 signed bytes from [R9+4] (skip 4-byte float scale) */
-    /* vmovdqu ymm2, [r9+4] */
-    jit_vmovdqu_load256(b, YMM2, R9, 4);
+    /* Load 32 Q8 signed bytes from [R9+8] (skip 4B float d + 4B int32 isum) */
+    /* vmovdqu ymm2, [r9+8] */
+    jit_vmovdqu_load256(b, YMM2, R9, 8);
 
     /* vpmaddubsw ymm5, ymm0, ymm2 → 16×int16 (unsigned Q4 × signed Q8) */
     jit_vpmaddubsw256(b, YMM5, YMM0, YMM2);
@@ -2156,7 +2156,7 @@ jit_gemv_q8_fn jit_compile_q4_q8_gemv_avx2(int rows, int cols)
     int nb = cols / 32;
     if (nb < 1) return NULL;
     int q4_row_bytes = nb * 18;       /* Q4_0: 18 bytes per block */
-    int q8_block_bytes = 36;          /* q8_input_t: 4B float + 32B qs = 36 bytes */
+    int q8_block_bytes = 40;          /* q8_input_t: 4B float d + 4B int32 isum + 32B qs = 40 */
 
     /* This kernel is large due to per-block scalar h-sum. Allocate generously. */
     jit_buf_t *buf = jit_create(16384);

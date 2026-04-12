@@ -277,4 +277,12 @@ int  llm_chat_context_tokens(void);
 /** Return the total context-window capacity of the loaded model. */
 int  llm_chat_context_max(void);
 
+/* ── Test-facing API (exposes internal tokenizer for unit tests) ─── */
+
+/** Tokenize text into token IDs. Returns number of tokens. */
+int llm_test_tokenize(const char *text, int text_len, int *tokens, int max_tokens);
+
+/** Decode a token ID into text. Returns byte length. */
+int llm_test_decode_token(int token_id, char *buf, int max_len);
+
 #endif /* TENSOROS_LLM_H */

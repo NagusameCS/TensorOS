@@ -1,4 +1,15 @@
 # prompt|must_contain
+# P0 regression gate: every case must pass before any release
+# Basic knowledge
 What is 2+2?|4
 Name one benefit of unit tests.|test
 Explain CPU cache in one sentence.|cache
+# Reasoning / factual
+What is the capital of France?|Paris
+How many sides does a triangle have?|3
+What color is the sky on a clear day?|blue
+# Code / technical
+Write a Python hello world one-liner.|print
+What does HTTP stand for?|protocol
+# Multi-token / longer
+List three primary colors.|red

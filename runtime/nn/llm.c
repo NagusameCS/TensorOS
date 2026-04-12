@@ -1651,7 +1651,14 @@ static void gemv_worker_avx2(void *arg)
         return;
     }
 
-    /* Q4_0 fast path: float fused GEMV */
+    /* Q4_0 integer path: use pre-quantized Q8 input if available */
+    if (w->type == GGML_TYPE_Q4_0 && w->xq) {
+        llm_gemv_q4_q8_fused_range_avx2(w->out, w->weight, w->xq,
+                                         w->row_start, w->row_end, w->in_dim);
+        return;
+    }
+
+    /* Q4_0 float fallback */
     if (w->type == GGML_TYPE_Q4_0) {
         llm_gemv_q4_fused_range_avx2(w->out, w->weight, w->x,
                                       w->row_start, w->row_end, w->in_dim);
@@ -1683,17 +1690,48 @@ static void llm_gemv(float *out, const void *weight, const float *x,
         }
     }
 
-    /* Q4×Q8 integer path disabled — JIT path only (non-JIT uses parallel below) */
-    if (0 && cpu_features.avx2_usable && type == GGML_TYPE_Q4_0) {
+    /* Q4×Q8 integer GEMV: pre-quantize input to Q8, then use integer dot */
+    if (cpu_features.avx2_usable && type == GGML_TYPE_Q4_0) {
         int nb = in_dim / 32;
         if (nb <= Q8_MAX_BLOCKS) {
-            jit_gemv_q8_fn jfn = llm_get_jit_gemv_q4q8(out_dim, in_dim);
-            if (jfn) {
-                q8_quantize_row(llm_xq_buf, x, in_dim);
-                /* JIT fn takes q8_input_t* as 3rd arg (same pointer type as float*) */
-                jfn(out, weight, (const float *)(void *)llm_xq_buf, out_dim, in_dim);
+            /* Pre-quantize input vector to Q8 for integer dot path */
+            q8_quantize_row(llm_xq_buf, x, in_dim);
+
+            /* Parallel Q4xQ8 integer GEMV across all CPUs */
+            uint32_t ncpu = smp.ap_started + 1;
+            if (ncpu > 1 && out_dim >= 64) {
+                int rows_per_cpu = out_dim / ncpu;
+                int remainder    = out_dim % ncpu;
+                int row = 0;
+                int bsp_chunk = rows_per_cpu + (remainder > 0 ? 1 : 0);
+                int bsp_start = 0;
+                int bsp_end   = bsp_chunk;
+                row = bsp_end;
+
+                for (uint32_t c = 1; c < ncpu; c++) {
+                    int chunk = rows_per_cpu + ((int)c < remainder ? 1 : 0);
+                    gemv_work_items[c].out      = out;
+                    gemv_work_items[c].weight   = weight;
+                    gemv_work_items[c].x        = x;
+                    gemv_work_items[c].xq       = llm_xq_buf;
+                    gemv_work_items[c].out_dim  = out_dim;
+                    gemv_work_items[c].in_dim   = in_dim;
+                    gemv_work_items[c].type     = type;
+                    gemv_work_items[c].row_start = row;
+                    gemv_work_items[c].row_end   = row + chunk;
+                    smp_dispatch(c, gemv_worker_avx2, &gemv_work_items[c]);
+                    row += chunk;
+                }
+                /* BSP does its share using integer path */
+                llm_gemv_q4_q8_fused_range_avx2(out, weight, llm_xq_buf,
+                                                 bsp_start, bsp_end, in_dim);
+                smp_wait_all();
                 return;
             }
+
+            /* Single-core fallback: fused integer GEMV */
+            llm_gemv_q4_q8_fused_avx2(out, weight, llm_xq_buf, out_dim, in_dim);
+            return;
         }
     }
 
@@ -4955,4 +4993,21 @@ int llm_chat_turn(const char *user_text, char *output, int max_output,
                              max_tokens, temperature, first_turn ? 0 : 1);
     __sync_lock_release(&llm_inference_active);
     return n_gen;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  Test-facing wrapper API (exposes internal tokenizer for unit tests)        */
+/* ─────────────────────────────────────────────────────────────────────────── */
+
+int llm_test_tokenize(const char *text, int text_len, int *tokens, int max_tokens)
+{
+    (void)text_len;
+    if (!llm_is_loaded()) return -1;
+    return llm_tokenize(&llm_model, text, tokens, max_tokens);
+}
+
+int llm_test_decode_token(int token_id, char *buf, int max_len)
+{
+    if (!llm_is_loaded()) return -1;
+    return llm_decode_token(&llm_model, token_id, buf, max_len);
 }
