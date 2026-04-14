@@ -1435,6 +1435,118 @@ jit_layernorm_fn jit_compile_layernorm_kernel(int dim)
     return fn;
 }
 
+/* =============================================================================
+ * Tokenizer/Detokenizer helper kernels
+ * =============================================================================*/
+
+static int jit_mem_equal_impl(const char *a, const char *b, int len)
+{
+    if (!a || !b || len < 0) return 0;
+    int i = 0;
+    for (; i + 8 <= len; i += 8) {
+        uint64_t wa, wb;
+        __builtin_memcpy(&wa, a + i, 8);
+        __builtin_memcpy(&wb, b + i, 8);
+        if (wa != wb) return 0;
+    }
+    for (; i < len; i++) {
+        if ((uint8_t)a[i] != (uint8_t)b[i]) return 0;
+    }
+    return 1;
+}
+
+static int jit_bpe_escape_scan_impl(const char *s, int len)
+{
+    if (!s || len <= 0) return 0;
+    for (int i = 0; i < len; i++) {
+        uint8_t c = (uint8_t)s[i];
+        if (c == 0xC4 || c == 0xC5) return 1;
+    }
+    return 0;
+}
+
+static int jit_find_byte_impl(const char *s, int len, char needle)
+{
+    if (!s || len <= 0) return -1;
+    for (int i = 0; i < len; i++) {
+        if (s[i] == needle) return i;
+    }
+    return -1;
+}
+
+jit_mem_equal_fn jit_compile_mem_equal_kernel(void)
+{
+    return jit_mem_equal_impl;
+}
+
+jit_bpe_escape_scan_fn jit_compile_bpe_escape_scan_kernel(void)
+{
+    return jit_bpe_escape_scan_impl;
+}
+
+jit_find_byte_fn jit_compile_find_byte_kernel(void)
+{
+    return jit_find_byte_impl;
+}
+
+/* =============================================================================
+ * JIT Helper: BPE Merge Candidate Comparison
+ *
+ * Finds the first index where merge-score array A beats array B.
+ * Used by the BPE tokenizer to select the highest-priority merge pair
+ * without scanning the full (potentially long) merge table on every step.
+ *
+ * int merge_cmp(const int32_t *scores_a, const int32_t *scores_b, int n)
+ * Returns first index i where a[i] > b[i], or -1 if b always >= a.
+ * Early-exit pattern: cache-friendly for short merge windows.
+ * =============================================================================*/
+
+static int jit_merge_cmp_impl(const int32_t *a, const int32_t *b, int n)
+{
+    if (!a || !b || n <= 0) return -1;
+    /* 4-wide SIMD-style unroll for the common case (n is typically 8-64) */
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        if (a[i]     > b[i])     return i;
+        if (a[i + 1] > b[i + 1]) return i + 1;
+        if (a[i + 2] > b[i + 2]) return i + 2;
+        if (a[i + 3] > b[i + 3]) return i + 3;
+    }
+    for (; i < n; i++) {
+        if (a[i] > b[i]) return i;
+    }
+    return -1;
+}
+
+jit_merge_cmp_fn jit_compile_merge_cmp_kernel(void)
+{
+    return jit_merge_cmp_impl;
+}
+
+/* =============================================================================
+ * JIT Helper: Token Append with Bounds Check
+ *
+ * Appends one token ID to a context buffer, returning the new length.
+ * Provides a single call-site for agent context updates so the JIT
+ * append/splice hot-path can later be replaced with a generated stub.
+ *
+ * int token_append(int32_t *ids, int cur_len, int max_len, int32_t token_id)
+ * Returns new length, or -1 if already at capacity.
+ * =============================================================================*/
+
+static int jit_token_append_impl(int32_t *ids, int cur_len, int max_len,
+                                  int32_t token_id)
+{
+    if (!ids || cur_len < 0 || cur_len >= max_len) return -1;
+    ids[cur_len] = token_id;
+    return cur_len + 1;
+}
+
+jit_token_append_fn jit_compile_token_append_kernel(void)
+{
+    return jit_token_append_impl;
+}
+
 #else /* __aarch64__ */
 
 /* ARM64 stubs */
@@ -1450,5 +1562,10 @@ jit_axpy_fn jit_compile_axpy_kernel(int n) { (void)n; return NULL; }
 jit_fused_silu_mul_fn jit_compile_fused_silu_mul_kernel(int n) { (void)n; return NULL; }
 jit_silu_fn jit_compile_gelu_kernel(int n) { (void)n; return NULL; }
 jit_layernorm_fn jit_compile_layernorm_kernel(int d) { (void)d; return NULL; }
+jit_mem_equal_fn jit_compile_mem_equal_kernel(void) { return NULL; }
+jit_bpe_escape_scan_fn jit_compile_bpe_escape_scan_kernel(void) { return NULL; }
+jit_find_byte_fn jit_compile_find_byte_kernel(void) { return NULL; }
+jit_merge_cmp_fn jit_compile_merge_cmp_kernel(void) { return NULL; }
+jit_token_append_fn jit_compile_token_append_kernel(void) { return NULL; }
 
 #endif /* __aarch64__ */

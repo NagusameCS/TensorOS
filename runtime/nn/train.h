@@ -83,4 +83,34 @@ float nn_train(nn_model_t *model, const float *X, const float *Y,
 /* Run training demos during boot */
 void nn_train_demos(void);
 
+/* -------------------------------------------------------------------
+ * Policy Gradient Step (REINFORCE with Baseline)
+ *
+ * model    — shallow policy network mapping step features → advantage
+ * steps    — token-native rollout steps (llm_rollout_get_steps output)
+ * returns  — discounted returns (llm_rollout_compute_returns output)
+ * n_steps  — number of steps
+ * lr       — policy learning rate
+ *
+ * Returns mean |advantage| as a diagnostic. Weights updated in-place.
+ * ----------------------------------------------------------------- */
+
+/* Forward-declare rollout step type to avoid circular include of llm.h */
+#ifndef LLM_ROLLOUT_STEP_FWDDECL
+#define LLM_ROLLOUT_STEP_FWDDECL
+typedef struct {
+    int   token_id;
+    float logprob;
+    float value;
+    float reward;
+    int   done;
+} llm_rollout_step_t;
+#endif
+
+float nn_policy_gradient_step(nn_model_t *model,
+                               const llm_rollout_step_t *steps,
+                               const float *returns,
+                               int n_steps,
+                               float lr);
+
 #endif /* TENSOROS_NN_TRAIN_H */

@@ -38,3 +38,19 @@ check_tramp.pdb
 
 # Models (large binary files)
 models/
+
+# Host build outputs
+build_host/
+*.exe
+
+# Internal planning/notes (local-only)
+docs/internal/
+docs/IMPLEMENTATION_PLANNING.md
+docs/TOKEN_NATIVE_PIPELINE.md
+docs/EVOLUTION.md
+*.ideas.md
+*.scratch.md
+
+# Local benchmark snapshots
+bench_*.txt
+diff_full.txt

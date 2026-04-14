@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
 #ifdef HYPERTENSOR_HOSTED
 #include "hal.h"
@@ -213,6 +214,68 @@ static void test_chat_edge_cases(void) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
+ * Microbenchmark + parity consistency checks
+ * ════════════════════════════════════════════════════════════════════════ */
+static void test_tokenizer_microbench(void) {
+    static const char *corpus[] = {
+        "Hello world!",
+        "<|im_start|>user\nWrite a quicksort in C.<|im_end|>",
+        "The answer is 42 and pi is approximately 3.14159.",
+        "```python\nprint('token native')\n```",
+        "\xF0\x9F\x98\x80 emoji and unicode: \xE4\xB8\xAD",
+        "<start_of_turn>model\nReason in tokens only.<end_of_turn>",
+        "a a a a a a a a a a a a a a a a",
+        "SELECT * FROM logs WHERE level = 'error' ORDER BY ts DESC LIMIT 10;"
+    };
+
+    const int corpus_n = (int)(sizeof(corpus) / sizeof(corpus[0]));
+    const int iters = 1500;
+    int total_tok = 0;
+    int total_dec_bytes = 0;
+    clock_t t0, t1;
+
+    printf("  [Tokenizer microbench + parity]\n");
+
+    t0 = clock();
+    for (int it = 0; it < iters; it++) {
+        for (int c = 0; c < corpus_n; c++) {
+            const char *s = corpus[c];
+            int slen = (int)strlen(s);
+            int t1_ids[256], t2_ids[256];
+            int n1 = llm_test_tokenize(s, slen, t1_ids, 256);
+            int n2 = llm_test_tokenize(s, slen, t2_ids, 256);
+
+            ASSERT_TRUE(n1 >= 0 && n2 >= 0, "bench_tokenize_nonneg");
+            ASSERT_TRUE(n1 == n2, "bench_parity_count");
+
+            if (n1 == n2 && n1 >= 0) {
+                int same = 1;
+                for (int i = 0; i < n1; i++) {
+                    if (t1_ids[i] != t2_ids[i]) { same = 0; break; }
+                }
+                ASSERT_TRUE(same, "bench_parity_ids");
+                total_tok += n1;
+            }
+
+            for (int i = 0; i < n1; i++) {
+                char out[256];
+                int dec = llm_test_decode_token(t1_ids[i], out, sizeof(out));
+                if (dec > 0) total_dec_bytes += dec;
+            }
+        }
+    }
+    t1 = clock();
+
+    {
+        double sec = (double)(t1 - t0) / (double)CLOCKS_PER_SEC;
+        double tok_per_s = sec > 0.0 ? (double)total_tok / sec : 0.0;
+        double dec_bps = sec > 0.0 ? (double)total_dec_bytes / sec : 0.0;
+        printf("    tokens=%d decode_bytes=%d time=%.3fs tok/s=%.1f dec_B/s=%.1f\n",
+               total_tok, total_dec_bytes, sec, tok_per_s, dec_bps);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
  * MAIN
  * ════════════════════════════════════════════════════════════════════════ */
 int main(int argc, char **argv) {
@@ -251,6 +314,7 @@ int main(int argc, char **argv) {
     test_tokenizer_roundtrip();
     test_tokenizer_random_bytes();
     test_chat_edge_cases();
+    test_tokenizer_microbench();
 
     printf("\n=== Tokenizer Results: %d/%d passed", tests_passed, tests_run);
     if (tests_failed > 0)

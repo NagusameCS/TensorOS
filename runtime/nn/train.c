@@ -807,3 +807,92 @@ void nn_train_demos(void)
 
     kprintf("[TRAIN] Complete - kernel learned %d models during boot\n", 3);
 }
+
+/* =============================================================================
+ * Policy Gradient Step (REINFORCE with Baseline)
+ *
+ * Applies a single REINFORCE update over a completed token-native rollout.
+ * Each rollout step carries a token_id, log-probability, and value estimate.
+ * Discounted returns G_t are supplied by llm_rollout_compute_returns.
+ *
+ * Algorithm:
+ *   baseline  = mean(G_t)               -- subtract to reduce variance
+ *   advantage = G_t - baseline
+ *   For each step t:
+ *     Encode step state as mini input vector → forward + backward
+ *     Scale output-layer delta by advantage_t (policy-gradient signal)
+ *   Apply accumulated gradients with SGD (lr provided by caller).
+ *
+ * Returns: mean |advantage| as a diagnostic scalar.
+ * =============================================================================*/
+#include "runtime/nn/llm.h"
+
+float nn_policy_gradient_step(nn_model_t *model,
+                               const llm_rollout_step_t *steps,
+                               const float *returns,
+                               int n_steps,
+                               float lr)
+{
+    if (!model || !steps || !returns || n_steps <= 0) return 0.0f;
+    if (model->num_layers <= 0) return 0.0f;
+
+    /* Baseline = mean(returns) — reduces gradient variance */
+    float baseline = 0.0f;
+    for (int i = 0; i < n_steps; i++) baseline += returns[i];
+    baseline /= (float)n_steps;
+
+    float mean_abs_adv = 0.0f;
+    int   batch_count  = 0;
+
+    train_zero_grad(model);
+
+    int in_dim  = model->layers[0].in_dim;
+    int out_dim = model->layers[model->num_layers - 1].out_dim;
+    if (in_dim  > TRAIN_MAX_DIM) in_dim  = TRAIN_MAX_DIM;
+    if (out_dim > TRAIN_MAX_DIM) out_dim = TRAIN_MAX_DIM;
+
+    /* Per-step static buffers (fine: single-threaded kernel context) */
+    static float pg_input[TRAIN_MAX_DIM]  __attribute__((aligned(16)));
+    static float pg_target[TRAIN_MAX_DIM] __attribute__((aligned(16)));
+
+    for (int t = 0; t < n_steps; t++) {
+        float advantage = returns[t] - baseline;
+        mean_abs_adv += advantage > 0.0f ? advantage : -advantage;
+
+        /* Encode step into input feature vector:
+         *   [0] logprob (log-probability of the chosen token)
+         *   [1] value   (critic estimate, if available)
+         *   [2] token_id normalised to ~[-1, 1] range
+         * Remaining features zeroed so earlier in_dim values don't corrupt. */
+        for (int i = 0; i < in_dim; i++) pg_input[i] = 0.0f;
+        if (in_dim >= 1) pg_input[0] = steps[t].logprob;
+        if (in_dim >= 2) pg_input[1] = steps[t].value;
+        if (in_dim >= 3) pg_input[2] = (float)steps[t].token_id * 1e-5f;
+
+        /* Policy-gradient target: advantage at output dimension 0.
+         * The network learns to associate state features with advantage. */
+        for (int i = 0; i < out_dim; i++) pg_target[i] = 0.0f;
+        if (out_dim >= 1) pg_target[0] = advantage;
+
+        train_forward(model, pg_input);
+        train_backward(model, pg_target);
+        batch_count++;
+    }
+
+    if (batch_count == 0) return 0.0f;
+
+    /* SGD update — no momentum/Adam so policy gradient is applied cleanly */
+    nn_train_config_t cfg = {
+        .learning_rate = lr,
+        .momentum      = 0.0f,
+        .weight_decay  = 0.0f,
+        .optimizer     = OPTIM_SGD,
+        .epochs        = 1,
+        .batch_size    = n_steps,
+        .beta1 = 0, .beta2 = 0, .epsilon = 0,
+    };
+    train_update_weights(model, &cfg, batch_count);
+    train_zero_grad(model);
+
+    return mean_abs_adv / (float)n_steps;
+}

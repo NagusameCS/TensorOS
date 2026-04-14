@@ -47,6 +47,22 @@ typedef float v8f __attribute__((vector_size(32)));
 /* Forward declarations */
 static void llm_build_hash_table(const llm_model_t *m);
 static uint64_t llm_row_bytes(int in_dim, ggml_type_t type);
+static int llm_decode_token(const llm_model_t *m, int token_id, char *buf, int max_len);
+static char *llm_strstr(const char *haystack, const char *needle);
+static float llm_get_f(const void *data, int idx, ggml_type_t type);
+
+/* ─────────────────────────────────────────────────────────────────────────── */
+/*  Debug/Trace Logging Macros                                                 */
+/* ─────────────────────────────────────────────────────────────────────────── */
+#ifndef LOG_DBG
+#define LOG_DBG(tag, fmt, ...)  kprintf("[" tag "] " fmt "\n", ##__VA_ARGS__)
+#endif
+#ifndef LOG_INFO
+#define LOG_INFO(tag, fmt, ...) kprintf("[" tag "] " fmt "\n", ##__VA_ARGS__)
+#endif
+#ifndef LOG_TRC
+#define LOG_TRC(tag, fmt, ...)  do {} while (0)  /* Trace: compiled out */
+#endif
 
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  Static Allocations                                                         */
@@ -65,7 +81,13 @@ static volatile int llm_inference_active = 0;
 typedef void (*llm_token_cb_t)(const char *text, int len, void *userdata);
 static llm_token_cb_t llm_stream_cb   = (llm_token_cb_t)0;
 static void          *llm_stream_cb_ud = (void *)0;
-static llm_backend_t  llm_backend      = LLM_BACKEND_CPU;
+static llm_backend_t  llm_backend        = LLM_BACKEND_CPU;
+static int            llm_last_vram_mb   = 0;
+static float          llm_last_prefill_ms_val = 0.0f;
+static float          llm_last_tok_per_sec_val = 0.0f;
+static jit_mem_equal_fn llm_jit_mem_equal = (jit_mem_equal_fn)0;
+static jit_bpe_escape_scan_fn llm_jit_bpe_escape_scan = (jit_bpe_escape_scan_fn)0;
+static jit_find_byte_fn llm_jit_find_byte = (jit_find_byte_fn)0;
 
 /* Tensor bridge for hidden-state injection / daisy-chaining */
 static tensor_bridge_t llm_bridge;
@@ -73,6 +95,45 @@ static tensor_bridge_t llm_bridge;
 void llm_set_stream_cb(llm_token_cb_t cb, void *userdata) {
     llm_stream_cb    = cb;
     llm_stream_cb_ud = userdata;
+}
+
+static int llm_decode_tokens_to_text(const llm_model_t *m, const int *tokens,
+                                     int n_tokens, char *output_text, int max_text_len)
+{
+    int out_pos = 0;
+
+    if (!output_text || max_text_len <= 0) return 0;
+    output_text[0] = '\0';
+    if (!m || !tokens || n_tokens <= 0) return 0;
+
+    for (int i = 0; i < n_tokens && out_pos < max_text_len - 1; i++) {
+        char tok_buf[128];
+        int tok_len = llm_decode_token(m, tokens[i], tok_buf, sizeof(tok_buf));
+        if (tok_len <= 0) continue;
+        for (int j = 0; j < tok_len && out_pos < max_text_len - 1; j++)
+            output_text[out_pos++] = tok_buf[j];
+    }
+
+    output_text[out_pos] = '\0';
+
+    {
+        static const char *stop_seqs[] = {
+            "<|im_end|>", "<|endoftext|>", "<|end|>",
+            "<|eot_id|>", "<|end_of_turn|>", NULL
+        };
+        for (int si = 0; stop_seqs[si]; si++) {
+            char *found = llm_strstr(output_text, stop_seqs[si]);
+            if (found) {
+                *found = '\0';
+                out_pos = (int)(found - output_text);
+                break;
+            }
+        }
+        while (out_pos > 0 && (output_text[out_pos - 1] == ' ' || output_text[out_pos - 1] == '\n'))
+            output_text[--out_pos] = '\0';
+    }
+
+    return out_pos;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -107,6 +168,125 @@ static int llm_alloc_vocab;
 static int llm_alloc_tokens;
 static int llm_alloc_kv_floats;
 
+/* Prefix-keyed KV snapshots (token-native boundary for cache reuse). */
+#define LLM_KV_SNAPSHOT_SLOTS 4
+typedef struct {
+    int in_use;
+    uint32_t prefix_hash;
+    int n_prefix_tokens;
+    int cached_len;
+    int n_layers;
+    int max_seq;
+    int n_kv_heads;
+    int head_dim;
+    int *prefix_tokens;
+    float *k_cache;
+    float *v_cache;
+} llm_kv_snapshot_slot_t;
+
+static llm_kv_snapshot_slot_t llm_kv_snapshots[LLM_KV_SNAPSHOT_SLOTS];
+static int llm_kv_snapshot_evict;
+
+#define LLM_AGENT_CTX_SLOTS 4
+#define LLM_AGENT_CTX_MAX_TOKENS 32768
+typedef struct {
+    int in_use;
+    int n_tokens;
+    int tokens[LLM_AGENT_CTX_MAX_TOKENS];
+} llm_agent_ctx_slot_t;
+
+static llm_agent_ctx_slot_t llm_agent_ctx[LLM_AGENT_CTX_SLOTS];
+
+#define LLM_RAG_PREFIX_MAX 32
+typedef struct {
+    int active;
+    int n_prefix;
+    int dim;
+    float *emb;
+} llm_rag_prefix_t;
+
+static llm_rag_prefix_t llm_rag_prefix;
+
+typedef struct {
+    int n_steps;
+    llm_rollout_step_t steps[LLM_ROLLOUT_MAX_STEPS];
+} llm_rollout_trace_t;
+
+static llm_rollout_trace_t llm_rollout_trace;
+
+static void llm_rag_prefix_clear_internal(void)
+{
+    if (llm_rag_prefix.emb) tensor_free(llm_rag_prefix.emb);
+    kmemset(&llm_rag_prefix, 0, sizeof(llm_rag_prefix));
+}
+
+/* Approximate vector-prefix injection: map embedding vector to nearest token
+ * embedding by dot-product score. This keeps the path text-free while
+ * remaining compatible with the token-only transformer input API. */
+static int llm_rag_embedding_to_token(const llm_model_t *m, const float *emb)
+{
+    int best = 0;
+    float best_score = -3.4e38f;
+    int dim;
+    if (!m || !emb) return -1;
+    dim = m->dim;
+
+    for (int t = 0; t < m->vocab_size; t++) {
+        float score = 0.0f;
+        for (int i = 0; i < dim; i++) {
+            int flat = (int)((uint64_t)t * (uint64_t)dim + (uint64_t)i);
+            float w = llm_get_f(m->token_embd, flat, m->token_embd_type);
+            score += emb[i] * w;
+        }
+        if (score > best_score) {
+            best_score = score;
+            best = t;
+        }
+    }
+    return best;
+}
+
+static uint32_t llm_hash_tokens(const int *tokens, int n)
+{
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < n; i++) {
+        uint32_t v = (uint32_t)tokens[i];
+        h ^= (v & 0xFFu);
+        h *= 16777619u;
+        h ^= ((v >> 8) & 0xFFu);
+        h *= 16777619u;
+        h ^= ((v >> 16) & 0xFFu);
+        h *= 16777619u;
+        h ^= ((v >> 24) & 0xFFu);
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void llm_kv_snapshot_clear_slot(llm_kv_snapshot_slot_t *s)
+{
+    if (!s) return;
+    if (s->prefix_tokens) tensor_free(s->prefix_tokens);
+    if (s->k_cache) tensor_free(s->k_cache);
+    if (s->v_cache) tensor_free(s->v_cache);
+    kmemset(s, 0, sizeof(*s));
+}
+
+static int llm_kv_snapshot_prefix_match(const llm_kv_snapshot_slot_t *s,
+                                        const int *prefix_tokens,
+                                        int n_prefix_tokens,
+                                        uint32_t prefix_hash)
+{
+    if (!s || !s->in_use) return 0;
+    if (s->prefix_hash != prefix_hash) return 0;
+    if (s->n_prefix_tokens != n_prefix_tokens) return 0;
+    if (!s->prefix_tokens || !prefix_tokens) return 0;
+    for (int i = 0; i < n_prefix_tokens; i++) {
+        if (s->prefix_tokens[i] != prefix_tokens[i]) return 0;
+    }
+    return 1;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  GPU Weight Offload (CUDA)                                                  */
 /*                                                                             */
@@ -118,12 +298,27 @@ static int llm_alloc_kv_floats;
 #ifdef ENABLE_CUDA
 
 #define GPU_WEIGHT_MAP_MAX 512
+#define GPU_MAX_LAYERS     128
 
 typedef struct {
     const void *host_ptr;   /* mmap'd host weight pointer (lookup key) */
     void       *dev_ptr;    /* GPU device pointer */
     uint64_t    size;       /* Tensor size in bytes */
 } gpu_weight_entry_t;
+
+/* Per-layer GPU-resident norm weights and KV cache */
+typedef struct {
+    float *d_attn_norm;        /* [dim] attention RMSNorm weight (F32 on GPU) */
+    float *d_ffn_norm;         /* [dim] FFN RMSNorm weight */
+    float *d_post_attn_norm;   /* [dim] post-attention norm (Gemma4, NULL if absent) */
+    float *d_post_ffw_norm;    /* [dim] post-FFW norm (Gemma4, NULL if absent) */
+    float *d_q_norm;           /* [n_heads * lhd] per-head Q norm (NULL if absent) */
+    float *d_k_norm;           /* [n_kv * lhd] per-head K norm (NULL if absent) */
+    float *d_k_cache;          /* [n_kv * max_seq * lhd] KV cache K */
+    float *d_v_cache;          /* [n_kv * max_seq * lhd] KV cache V */
+    float *d_iswa_post_norm;   /* [dim] ISWA post-norm weight (Gemma4, NULL if absent) */
+    int    lhd;                /* actual head dim for this layer */
+} gpu_layer_t;
 
 static struct {
     int active;                            /* 1 if GPU offload is live */
@@ -133,6 +328,44 @@ static struct {
     float *d_out;                          /* Device output scratch */
     int max_in_dim;
     int max_out_dim;
+
+    /* GPU-resident forward pass state */
+    int gpu_fwd;                /* 1 if GPU-resident forward pass is ready */
+    float *d_xn;                /* [dim] normalized hidden state */
+    float *d_q;                 /* [max_q_dim] Q projection output */
+    float *d_k;                 /* [max_kv_dim] K buffer */
+    float *d_v;                 /* [max_kv_dim] V buffer */
+    float *d_attn;              /* [max_q_dim] attention output */
+    float *d_ffn_g;             /* [max_ff] FFN gate */
+    float *d_ffn_u;             /* [max_ff] FFN up */
+    float *d_ffn_d;             /* [dim] FFN down / scratch */
+    float *d_output_norm;       /* [dim] final output norm weights */
+    float *d_rope_freqs;        /* RoPE freq factors for full-attn layers (NULL if unused) */
+    gpu_layer_t layers[GPU_MAX_LAYERS];
+
+    /* Cached model dimensions for GPU forward pass */
+    int dim;
+    int max_seq;
+    int n_heads;
+    int n_kv;
+    int head_dim;               /* max head dim */
+    int head_dim_swa;           /* SWA head dim (Gemma4) */
+    int max_ff;
+    int vocab_size;
+    float rms_eps;
+    int n_layers;
+    int is_gemma4;
+    int use_geglu;
+    int use_gelu;
+    int use_layernorm;
+    int n_layer_kv_start;       /* Gemma4: first layer with own KV */
+    float rope_base;
+    float rope_base_swa;
+
+    /* ISWA GPU-resident state (Gemma4) */
+    float *d_iswa_tmp;          /* [iswa_n_embd] ISWA gating scratch */
+    float *d_iswa_per_layer;    /* [iswa_n_embd * n_layers] precomputed per-token */
+    int iswa_n_embd;
 } gpu_ctx;
 
 /* Look up device pointer for a host weight pointer */
@@ -167,13 +400,30 @@ static int llm_gpu_upload_weight_mat(const void *weight, int out_dim, int in_dim
                                      ggml_type_t type) {
     if (!weight) return 0;
     /* Only upload types the CUDA GEMV kernel can handle */
-    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q8_0 &&
+    if (type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q4_1 && type != GGML_TYPE_Q8_0 &&
         type != GGML_TYPE_F32  && type != GGML_TYPE_F16  &&
-        type != GGML_TYPE_Q6_K)
+        type != GGML_TYPE_Q6_K && type != GGML_TYPE_BF16)
         return 0;
     uint64_t rb = llm_row_bytes(in_dim, type);
     uint64_t size = (uint64_t)out_dim * rb;
     return llm_gpu_register_weight(weight, size);
+}
+
+/* Upload a norm weight vector to GPU as F32.
+ * For F32 norm weights: direct upload.
+ * For non-F32: skip (returns NULL) — caller falls back to CPU for that norm. */
+static float *llm_gpu_upload_norm(const void *weight, int dim, ggml_type_t type) {
+    if (!weight || dim <= 0) return (float *)0;
+    const backend_t *be = backend_get_by_id(BACKEND_CUDA);
+    if (!be) return (float *)0;
+
+    if (type == GGML_TYPE_F32) {
+        float *d = (float *)be->mem.alloc((uint64_t)dim * sizeof(float));
+        if (d) be->mem.upload(d, weight, (uint64_t)dim * sizeof(float));
+        return d;
+    }
+    /* Non-F32 norm weights: not supported on GPU path */
+    return (float *)0;
 }
 
 /* Upload all model weights to GPU. Called after model load if CUDA available. */
@@ -261,8 +511,139 @@ static int llm_gpu_init(llm_model_t *m) {
         total += gpu_ctx.map[i].size;
 
     gpu_ctx.active = 1;
+    llm_last_vram_mb = (int)(total / (1024 * 1024));
+    llm_backend = LLM_BACKEND_CUDA;
     kprintf("[GPU] Uploaded %d weight tensors (%llu MB) to VRAM\n",
             gpu_ctx.map_count, (unsigned long long)(total / (1024 * 1024)));
+
+    /* ── GPU-Resident Forward Pass Setup ── */
+    /* Allocate activation buffers and KV cache on GPU.
+     * Upload norm weights so the entire forward pass stays on device. */
+
+    gpu_ctx.dim        = dim;
+    gpu_ctx.max_seq    = m->max_seq;
+    gpu_ctx.n_heads    = n_heads;
+    gpu_ctx.n_kv       = n_kv;
+    gpu_ctx.head_dim   = hd;
+    gpu_ctx.head_dim_swa = m->is_gemma4 ? m->head_dim_swa : hd;
+    gpu_ctx.max_ff     = ff;
+    gpu_ctx.vocab_size = m->vocab_size;
+    gpu_ctx.rms_eps    = m->rms_eps;
+    gpu_ctx.n_layers   = m->n_layers;
+    gpu_ctx.is_gemma4  = m->is_gemma4;
+    gpu_ctx.use_geglu  = m->use_geglu;
+    gpu_ctx.use_gelu   = m->use_gelu;
+    gpu_ctx.use_layernorm = m->use_layernorm;
+    gpu_ctx.n_layer_kv_start = m->n_layer_kv_start;
+    gpu_ctx.rope_base  = m->rope_base;
+    gpu_ctx.rope_base_swa = m->is_gemma4 ? m->rope_base_swa : m->rope_base;
+
+    /* Activation scratch buffers */
+    gpu_ctx.d_xn    = (float *)be->mem.alloc((uint64_t)dim * sizeof(float));
+    gpu_ctx.d_q     = (float *)be->mem.alloc((uint64_t)q_dim * sizeof(float));
+    gpu_ctx.d_k     = (float *)be->mem.alloc((uint64_t)kv_dim * sizeof(float));
+    gpu_ctx.d_v     = (float *)be->mem.alloc((uint64_t)kv_dim * sizeof(float));
+    gpu_ctx.d_attn  = (float *)be->mem.alloc((uint64_t)q_dim * sizeof(float));
+    gpu_ctx.d_ffn_g = (float *)be->mem.alloc((uint64_t)ff * sizeof(float));
+    gpu_ctx.d_ffn_u = (float *)be->mem.alloc((uint64_t)ff * sizeof(float));
+    gpu_ctx.d_ffn_d = (float *)be->mem.alloc((uint64_t)dim * sizeof(float));
+
+    int fwd_ok = gpu_ctx.d_xn && gpu_ctx.d_q && gpu_ctx.d_k && gpu_ctx.d_v &&
+                 gpu_ctx.d_attn && gpu_ctx.d_ffn_g && gpu_ctx.d_ffn_u && gpu_ctx.d_ffn_d;
+
+    /* Per-layer KV cache + norm weights */
+    if (fwd_ok && m->n_layers <= GPU_MAX_LAYERS) {
+        for (int L = 0; L < m->n_layers && fwd_ok; L++) {
+            llm_layer_t *layer = &m->layers[L];
+            int lhd = layer->head_dim_layer ? layer->head_dim_layer : hd;
+            uint64_t kv_layer_size = (uint64_t)n_kv * m->max_seq * lhd * sizeof(float);
+            gpu_layer_t *gl = &gpu_ctx.layers[L];
+            gl->lhd = lhd;
+
+            /* KV cache: only for layers with own KV (not shared) */
+            if (layer->kv_reuse_layer < 0) {
+                gl->d_k_cache = (float *)be->mem.alloc(kv_layer_size);
+                gl->d_v_cache = (float *)be->mem.alloc(kv_layer_size);
+                if (!gl->d_k_cache || !gl->d_v_cache) { fwd_ok = 0; break; }
+                /* Zero-init KV cache */
+                be->mem.upload(gl->d_k_cache, llm_kv_k, kv_layer_size); /* zeros from alloc_scratch */
+                be->mem.upload(gl->d_v_cache, llm_kv_v, kv_layer_size);
+            }
+
+            /* Norm weights */
+            gl->d_attn_norm = llm_gpu_upload_norm(layer->attn_norm, dim, layer->attn_norm_type);
+            gl->d_ffn_norm  = llm_gpu_upload_norm(layer->ffn_norm, dim, layer->ffn_norm_type);
+            gl->d_post_attn_norm = llm_gpu_upload_norm(layer->post_attn_norm, dim, GGML_TYPE_F32);
+            gl->d_post_ffw_norm  = llm_gpu_upload_norm(layer->post_ffw_norm, dim, GGML_TYPE_F32);
+
+            /* Per-head Q/K norm (Gemma4) */
+            if (layer->q_norm)
+                gl->d_q_norm = llm_gpu_upload_norm(layer->q_norm, n_heads * lhd, GGML_TYPE_F32);
+            if (layer->k_norm)
+                gl->d_k_norm = llm_gpu_upload_norm(layer->k_norm, n_kv * lhd, GGML_TYPE_F32);
+
+            /* ISWA post-norm (Gemma4) */
+            if (layer->iswa_post_norm)
+                gl->d_iswa_post_norm = llm_gpu_upload_norm(layer->iswa_post_norm, dim, GGML_TYPE_F32);
+
+            if (!gl->d_attn_norm || !gl->d_ffn_norm) { fwd_ok = 0; break; }
+        }
+    } else {
+        fwd_ok = 0;
+    }
+
+    /* Output norm */
+    if (fwd_ok) {
+        gpu_ctx.d_output_norm = llm_gpu_upload_norm(m->output_norm, dim, m->output_norm_type);
+        if (!gpu_ctx.d_output_norm) fwd_ok = 0;
+    }
+
+    /* RoPE freq factors (Gemma4: precomputed for full-attention layers) */
+    if (fwd_ok && m->rope_freqs) {
+        int half_hd = hd / 2;
+        gpu_ctx.d_rope_freqs = (float *)be->mem.alloc((uint64_t)half_hd * sizeof(float));
+        if (gpu_ctx.d_rope_freqs)
+            be->mem.upload(gpu_ctx.d_rope_freqs, m->rope_freqs, (uint64_t)half_hd * sizeof(float));
+    }
+
+    /* ISWA GPU scratch (Gemma4: eliminate per-layer CPU round-trip) */
+    if (fwd_ok && m->is_gemma4 && m->iswa_n_embd > 0) {
+        int iswa_d = m->iswa_n_embd;
+        gpu_ctx.iswa_n_embd = iswa_d;
+        gpu_ctx.d_iswa_tmp = (float *)be->mem.alloc((uint64_t)iswa_d * sizeof(float));
+        gpu_ctx.d_iswa_per_layer = (float *)be->mem.alloc(
+            (uint64_t)iswa_d * m->n_layers * sizeof(float));
+        if (!gpu_ctx.d_iswa_tmp || !gpu_ctx.d_iswa_per_layer) {
+            gpu_ctx.d_iswa_tmp = NULL;
+            gpu_ctx.d_iswa_per_layer = NULL;
+        }
+    }
+
+    /* Set up shared KV cache pointers for layers that reuse */
+    if (fwd_ok) {
+        for (int L = 0; L < m->n_layers; L++) {
+            llm_layer_t *layer = &m->layers[L];
+            if (layer->kv_reuse_layer >= 0 && layer->kv_reuse_layer < m->n_layers) {
+                gpu_ctx.layers[L].d_k_cache = gpu_ctx.layers[layer->kv_reuse_layer].d_k_cache;
+                gpu_ctx.layers[L].d_v_cache = gpu_ctx.layers[layer->kv_reuse_layer].d_v_cache;
+            }
+        }
+    }
+
+    be->mem.sync();
+
+    if (fwd_ok) {
+        gpu_ctx.gpu_fwd = 1; /* GPU traces */
+        /* Re-tally total VRAM */
+        total = 0;
+        for (int i = 0; i < gpu_ctx.map_count; i++) total += gpu_ctx.map[i].size;
+        uint64_t used = free_mem - be->get_free_memory(0);
+        llm_last_vram_mb = (int)(used / (1024 * 1024));
+        kprintf("[GPU] GPU-resident forward pass ready (total VRAM: %d MB)\n", llm_last_vram_mb);
+    } else {
+        kprintf("[GPU] GPU-resident forward pass not available, using upload/download per GEMV\n");
+    }
+
     return 0;
 }
 
@@ -819,12 +1200,16 @@ static inline v8f v8f_expf(v8f x) {
     v8f p = v8f_set1(1.0f) + r + r2 * v8f_set1(0.5f)
           + r3 * v8f_set1(0.16666666f) + r2 * r2 * v8f_set1(0.041666666f)
           + r2 * r3 * v8f_set1(0.008333333f) + r3 * r3 * v8f_set1(0.001388889f);
-    /* 2^n: convert n to int, add 127 bias, shift into IEEE754 exponent field */
-    union { int i[8]; v8f v; } ni, scale;
-    __asm__("vcvtps2dq %1, %0" : "=x"(ni.v) : "x"(nf));
-    for (int j = 0; j < 8; j++)
-        scale.i[j] = (ni.i[j] + 127) << 23;
-    return p * scale.v;
+    /* 2^n: SIMD integer arithmetic (replaces scalar loop) */
+    typedef int v8i_local __attribute__((vector_size(32)));
+    v8i_local ni_i;
+    __asm__("vcvtps2dq %1, %0" : "=x"(ni_i) : "x"(nf));
+    v8i_local bias = {127,127,127,127,127,127,127,127};
+    v8i_local sh   = {23,23,23,23,23,23,23,23};
+    v8i_local scale_i = (ni_i + bias) << sh;
+    v8f scale;
+    __builtin_memcpy(&scale, &scale_i, 32);
+    return p * scale;
 }
 
 /* SIMD int8→float: vpmovsxbd (sign-extend 8×i8→8×i32) + vcvtdq2ps
@@ -985,6 +1370,46 @@ static float q8_0_dot32_avx2(const ggml_q8_0_t *block, const float *x)
     return v8f_reduce(acc) * d;
 }
 
+/* AVX2 Q4_1 dot: process 32 elements per block using 8-wide
+ * Q4_1: dequant = d * nibble + m (unsigned nibbles 0-15)
+ * dot = sum(d * nibble_i * x_i + m * x_i) = d * sum(nibble_i * x_i) + m * sum(x_i) */
+__attribute__((target("avx2,fma")))
+static float q4_1_dot32_avx2(const ggml_q4_1_t *block, const float *x)
+{
+    float d = fp16_to_fp32_fast(block->d);
+    float m = fp16_to_fp32_fast(block->m);
+    const uint8_t *qs = block->qs;
+
+    /* Standard GGML layout: lo nibbles → x[0..15], hi nibbles → x[16..31] */
+    v8f qxacc_lo = v8f_setzero();
+    v8f qxacc_hi = v8f_setzero();
+    v8f xacc_lo = v8f_setzero();
+    v8f xacc_hi = v8f_setzero();
+
+    for (int j = 0; j < 16; j += 8) {
+        uint8_t b0=qs[j], b1=qs[j+1], b2=qs[j+2], b3=qs[j+3];
+        uint8_t b4=qs[j+4], b5=qs[j+5], b6=qs[j+6], b7=qs[j+7];
+        v8f qlo = {(float)(b0&0xF), (float)(b1&0xF),
+                   (float)(b2&0xF), (float)(b3&0xF),
+                   (float)(b4&0xF), (float)(b5&0xF),
+                   (float)(b6&0xF), (float)(b7&0xF)};
+        v8f qhi = {(float)(b0>>4), (float)(b1>>4),
+                   (float)(b2>>4), (float)(b3>>4),
+                   (float)(b4>>4), (float)(b5>>4),
+                   (float)(b6>>4), (float)(b7>>4)};
+        v8f xlo; __builtin_memcpy(&xlo, x + j, 32);       /* x[j..j+7] */
+        v8f xhi; __builtin_memcpy(&xhi, x + j + 16, 32);  /* x[j+16..j+23] */
+        qxacc_lo += qlo * xlo;
+        qxacc_hi += qhi * xhi;
+        xacc_lo += xlo;
+        xacc_hi += xhi;
+    }
+
+    float qxsum = v8f_reduce(qxacc_lo + qxacc_hi);
+    float xsum  = v8f_reduce(xacc_lo + xacc_hi);
+    return d * qxsum + m * xsum;
+}
+
 /* AVX2 Q4_0 dot: process 32 elements per block using 8-wide */
 __attribute__((target("avx2,fma")))
 static float q4_0_dot32_avx2(const ggml_q4_0_t *block, const float *x)
@@ -1044,11 +1469,10 @@ static float llm_vec_dot_avx2(const void *weight, const float *x, int n, ggml_ty
         return sum;
     }
     case GGML_TYPE_Q4_1: {
-        /* Q4_1: d * nibble + m — use scalar path for now (AVX2 TODO) */
         const ggml_q4_1_t *blocks = (const ggml_q4_1_t *)weight;
         float sum = 0.0f;
         for (int b = 0; b < nb; b++)
-            sum += q4_1_dot32(&blocks[b], x + b * 32);
+            sum += q4_1_dot32_avx2(&blocks[b], x + b * 32);
         return sum;
     }
     case GGML_TYPE_F32: {
@@ -1295,16 +1719,24 @@ typedef char  v32b __attribute__((vector_size(32)));
 __attribute__((target("avx2,fma")))
 static inline float q4_0_q8_dot_avx2(const ggml_q4_0_t *w, const q8_input_t *xq)
 {
-    /* Scalar nibble unpack: 16 iterations, well-predicted by OOO hardware.
-     * Main improvement over old path: avoids the 32-iteration scalar xsum loop
-     * by using the precomputed xq->isum from q8_quantize_block. */
-    uint8_t q4u[32];
-    for (int j = 0; j < 16; j++) {
-        q4u[j]      = w->qs[j] & 0x0F;
-        q4u[j + 16] = w->qs[j] >> 4;
+    /* SIMD nibble unpack: broadcast 16 bytes → both lanes, then
+     * mask low nibbles (low lane) and shift+mask high nibbles (high lane). */
+    v32b q4_unsigned;
+    {
+        v32b raw;
+        __asm__("vbroadcasti128 (%1), %0" : "=x"(raw) : "r"(w->qs));
+        v32b shifted;
+        __asm__("vpsrlw $4, %1, %0" : "=x"(shifted) : "x"(raw));
+        v32b mask4 = {0xF,0xF,0xF,0xF,0xF,0xF,0xF,0xF,
+                      0xF,0xF,0xF,0xF,0xF,0xF,0xF,0xF,
+                      0xF,0xF,0xF,0xF,0xF,0xF,0xF,0xF,
+                      0xF,0xF,0xF,0xF,0xF,0xF,0xF,0xF};
+        raw = raw & mask4;
+        shifted = shifted & mask4;
+        __asm__("vpblendd $0xF0, %2, %1, %0"
+                : "=x"(q4_unsigned) : "x"(raw), "x"(shifted));
     }
 
-    v32b q4_unsigned; __builtin_memcpy(&q4_unsigned, q4u, 32);
     v32b xq_bytes;    __builtin_memcpy(&xq_bytes,    xq->qs, 32);
 
     /* vpmaddubsw: unsigned Q4 [0,15] × signed Q8 → 16 × int16 */
@@ -1850,12 +2282,11 @@ static void llm_gemv(float *out, const void *weight, const float *x,
 {
 #ifdef ENABLE_CUDA
     /* GPU-accelerated GEMV: look up pre-uploaded device weight.
-     * Only dispatch to CUDA for types the GPU kernels support.
-     * Size threshold: GPU overhead only pays off for large matrices. */
-    if (gpu_ctx.active && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0 ||
+     * Only dispatch to CUDA for types the GPU kernels support. */
+    if (gpu_ctx.active && (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ||
+                           type == GGML_TYPE_Q8_0 ||
                            type == GGML_TYPE_F32  || type == GGML_TYPE_F16  ||
-                           type == GGML_TYPE_Q6_K) &&
-        out_dim >= 8192) {
+                           type == GGML_TYPE_Q6_K)) {
         void *d_weight = llm_gpu_lookup(weight);
         if (d_weight) {
             const backend_t *be = backend_get_by_id(BACKEND_CUDA);
@@ -2558,6 +2989,17 @@ static void llm_axpy_f32_avx2(float *dst, float scale, const float *src, int n)
 {
     v8f sv = v8f_set1(scale);
     int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        v8f d0, s0, d1, s1;
+        __builtin_memcpy(&d0, dst+i, 32);
+        __builtin_memcpy(&s0, src+i, 32);
+        __builtin_memcpy(&d1, dst+i+8, 32);
+        __builtin_memcpy(&s1, src+i+8, 32);
+        d0 = d0 + sv * s0;
+        d1 = d1 + sv * s1;
+        __builtin_memcpy(dst+i, &d0, 32);
+        __builtin_memcpy(dst+i+8, &d1, 32);
+    }
     for (; i + 8 <= n; i += 8) {
         v8f d, s;
         __builtin_memcpy(&d, dst+i, 32);
@@ -2728,6 +3170,335 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
 #endif
 
     /* 1. Embedding lookup */
+
+#ifdef ENABLE_CUDA
+    /* ═════════════════════════════════════════════════════════════════════
+     * GPU-Resident Forward Pass
+     *
+     * When gpu_ctx.gpu_fwd is set, the entire forward pass runs on GPU.
+     * Activations stay in VRAM between operations — no PCIe round-trips
+     * except: ISWA injection (small tensors) and final logits download.
+     * ═════════════════════════════════════════════════════════════════════ */
+    if (gpu_ctx.gpu_fwd) {
+        const backend_t *be = backend_get_by_id(BACKEND_CUDA);
+        int max_seq = gpu_ctx.max_seq;
+        int seq_len = pos + 1;
+        int kv_stride_host = m->max_seq * n_kv * hd;
+        int kv_dim_host = n_kv * hd;
+
+        /* 1. Embedding on GPU: GPU embed only handles Q4_0 and F32.
+         * For other types (e.g. Q6_K), fall back to CPU dequant + upload. */
+        void *d_embd = llm_gpu_lookup(m->token_embd);
+        int embed_on_gpu = (m->token_embd_type == GGML_TYPE_Q4_0 ||
+                            m->token_embd_type == GGML_TYPE_F32);
+        if (d_embd && embed_on_gpu) {
+            be->compute.embed_lookup(gpu_ctx.d_x, d_embd, token_id, dim, m->token_embd_type);
+            /* Gemma: scale embedding by sqrt(dim) — GPU embed_lookup only dequantizes */
+            if (m->embed_scale != 0.0f && m->embed_scale != 1.0f)
+                be->compute.scale(gpu_ctx.d_x, gpu_ctx.d_x, m->embed_scale, dim);
+        } else {
+            /* Fallback: embed on CPU (handles all types + embed_scale), upload */
+            llm_embed(llm_x, m, token_id);
+            be->mem.upload(gpu_ctx.d_x, llm_x, (uint64_t)dim * sizeof(float));
+        }
+
+        /* === ISWA precomputation === */
+        if (m->is_gemma4 && m->iswa_tok_embd && m->iswa_model_proj) {
+            int iswa_d = m->iswa_n_embd;
+            int iswa_total = iswa_d * m->n_layers;
+            float inv_sqrt_dim = 1.0f / llm_sqrtf((float)dim);
+            float sqrt_iswa_d  = llm_sqrtf((float)iswa_d);
+            float inv_sqrt_2   = 1.0f / llm_sqrtf(2.0f);
+
+            /* Token embedding dequant (CPU — quantized lookup, fast) */
+            uint64_t emb_rb = llm_row_bytes(iswa_total, m->iswa_tok_embd_type);
+            const uint8_t *emb_row = (const uint8_t *)m->iswa_tok_embd
+                                     + (uint64_t)token_id * emb_rb;
+            if (m->iswa_tok_embd_type == GGML_TYPE_Q6_K) {
+                const ggml_q6_k_t *blocks = (const ggml_q6_k_t *)emb_row;
+                int nsb = iswa_total / 256;
+                for (int sb = 0; sb < nsb; sb++) {
+                    const ggml_q6_k_t *b = &blocks[sb];
+                    float d_val = fp16_to_fp32(b->d);
+                    float *o = llm_iswa_per_layer + sb * 256;
+                    for (int half = 0; half < 2; half++) {
+                        const uint8_t *ql_h = b->ql + half * 64;
+                        const uint8_t *qh_h = b->qh + half * 32;
+                        const int8_t *sc_h = b->scales + half * 8;
+                        for (int l = 0; l < 32; l++) {
+                            int q0 = (int)(ql_h[l] & 0xF)      | (int)(((qh_h[l] >> 0) & 3) << 4);
+                            int q1 = (int)(ql_h[l + 32] & 0xF)  | (int)(((qh_h[l] >> 2) & 3) << 4);
+                            int q2 = (int)(ql_h[l] >> 4)         | (int)(((qh_h[l] >> 4) & 3) << 4);
+                            int q3 = (int)(ql_h[l + 32] >> 4)    | (int)(((qh_h[l] >> 6) & 3) << 4);
+                            int si = l / 16;
+                            o[half*128 + l]      = d_val * (float)sc_h[0 + si] * (float)(q0 - 32);
+                            o[half*128 + l + 32] = d_val * (float)sc_h[2 + si] * (float)(q1 - 32);
+                            o[half*128 + l + 64] = d_val * (float)sc_h[4 + si] * (float)(q2 - 32);
+                            o[half*128 + l + 96] = d_val * (float)sc_h[6 + si] * (float)(q3 - 32);
+                        }
+                    }
+                }
+            } else {
+                for (int i = 0; i < iswa_total; i++)
+                    llm_iswa_per_layer[i] = llm_get_f(m->iswa_tok_embd, i, m->iswa_tok_embd_type);
+            }
+            for (int i = 0; i < iswa_total; i++)
+                llm_iswa_per_layer[i] *= sqrt_iswa_d;
+
+            /* Model projection GEMV — use GPU dispatch (same as CPU-fwd path) */
+            float *proj_buf = llm_ffn_g;
+            be->mem.download(llm_x, gpu_ctx.d_x, (uint64_t)dim * sizeof(float));
+            llm_gemv(proj_buf, m->iswa_model_proj, llm_x, iswa_total, dim,
+                     m->iswa_model_proj_type);
+            for (int i = 0; i < iswa_total; i++)
+                proj_buf[i] *= inv_sqrt_dim;
+
+            /* Per-layer RMSNorm on projection (CPU — 35 tiny norms, fast) */
+            if (m->iswa_proj_norm) {
+                const float *norm_w = (const float *)m->iswa_proj_norm;
+                for (int ll = 0; ll < m->n_layers; ll++) {
+                    float *sl = proj_buf + ll * iswa_d;
+                    float ss = 0.0f;
+                    for (int i = 0; i < iswa_d; i++) ss += sl[i] * sl[i];
+                    float rms = 1.0f / llm_sqrtf(ss / (float)iswa_d + m->rms_eps);
+                    for (int i = 0; i < iswa_d; i++) sl[i] = sl[i] * rms * norm_w[i];
+                }
+            }
+            for (int i = 0; i < iswa_total; i++)
+                llm_iswa_per_layer[i] = (llm_iswa_per_layer[i] + proj_buf[i]) * inv_sqrt_2;
+
+            /* Upload precomputed per-layer ISWA data to GPU */
+            if (gpu_ctx.d_iswa_per_layer)
+                be->mem.upload(gpu_ctx.d_iswa_per_layer, llm_iswa_per_layer,
+                               (uint64_t)iswa_total * sizeof(float));
+        }
+
+        /* === Per-layer transformer loop (GPU-resident) === */
+        for (int L = 0; L < m->n_layers; L++) {
+            llm_layer_t *layer = &m->layers[L];
+            gpu_layer_t *gl = &gpu_ctx.layers[L];
+            int lhd = layer->head_dim_layer ? layer->head_dim_layer : hd;
+            int lkv_dim = n_kv * lhd;
+            int lq_dim  = n_heads * lhd;
+            int has_own_kv = (layer->kv_reuse_layer < 0);
+
+            /* 2a. Pre-attention RMSNorm */
+            be->compute.rmsnorm(gpu_ctx.d_xn, gpu_ctx.d_x, gl->d_attn_norm,
+                                dim, gpu_ctx.rms_eps);
+
+            /* 2b. Q/K/V projections on GPU */
+            void *d_qw = llm_gpu_lookup(layer->q_weight);
+            be->compute.gemv(gpu_ctx.d_q, d_qw, gpu_ctx.d_xn, lq_dim, dim, layer->q_type);
+
+            if (has_own_kv) {
+                void *d_kw = llm_gpu_lookup(layer->k_weight);
+                void *d_vw = llm_gpu_lookup(layer->v_weight);
+                be->compute.gemv(gpu_ctx.d_k, d_kw, gpu_ctx.d_xn, lkv_dim, dim, layer->k_type);
+                be->compute.gemv(gpu_ctx.d_v, d_vw, gpu_ctx.d_xn, lkv_dim, dim, layer->v_type);
+            }
+
+            /* Per-head Q/K normalization + RoPE: fully GPU-resident */
+            float layer_rope_base = m->rope_base;
+            if (m->is_gemma4 && lhd == m->head_dim_swa)
+                layer_rope_base = m->rope_base_swa;
+            const float *rope_f_host = (const float *)0;
+            if (m->rope_factors_short || m->rope_factors_long)
+                rope_f_host = (pos < m->rope_orig_ctx) ? m->rope_factors_short : m->rope_factors_long;
+            if (m->is_gemma4 && m->rope_freqs && lhd != m->head_dim_swa)
+                rope_f_host = m->rope_freqs;
+            int rdim = m->rope_dim > 0 ? m->rope_dim : lhd;
+
+            /* GPU-resident: norm + RoPE via fused kernel */
+            if (layer->q_norm && has_own_kv) {
+                float *d_rope_f = (rope_f_host == m->rope_freqs) ? gpu_ctx.d_rope_freqs : (float *)0;
+                cuda_fused_qk_norm_rope(gpu_ctx.d_q, gpu_ctx.d_k,
+                    gl->d_q_norm, gl->d_k_norm,
+                    n_heads, n_kv, lhd,
+                    pos, layer_rope_base, d_rope_f,
+                    m->rms_eps, rdim);
+                cuda_v_norm(gpu_ctx.d_v, n_kv, lhd, m->rms_eps);
+            } else if (layer->q_norm) {
+                /* No own KV but has norm — norm Q only, RoPE Q only */
+                float *d_rope_f = (rope_f_host == m->rope_freqs) ? gpu_ctx.d_rope_freqs : (float *)0;
+                cuda_fused_qk_norm_rope(gpu_ctx.d_q, gpu_ctx.d_q, /* K unused */
+                    gl->d_q_norm, (float *)0,
+                    n_heads, 0, lhd,
+                    pos, layer_rope_base, d_rope_f,
+                    m->rms_eps, rdim);
+            } else {
+                /* No norm — just RoPE (non-Gemma4 models) */
+                float *d_rope_f = (rope_f_host == m->rope_freqs) ? gpu_ctx.d_rope_freqs : (float *)0;
+                if (has_own_kv) {
+                    be->compute.rope(gpu_ctx.d_q, gpu_ctx.d_k, lhd, n_heads, n_kv,
+                                     pos, layer_rope_base, d_rope_f);
+                } else {
+                    be->compute.rope(gpu_ctx.d_q, gpu_ctx.d_q, lhd, n_heads, 0,
+                                     pos, layer_rope_base, d_rope_f);
+                }
+            }
+
+            /* KV cache update on GPU */
+            if (has_own_kv) {
+                be->compute.kv_update(gl->d_k_cache, gl->d_v_cache,
+                                      gpu_ctx.d_k, gpu_ctx.d_v,
+                                      n_kv, lhd, pos, max_seq, L);
+            }
+
+            /* 2e. GPU-resident attention */
+            {
+                int kv_src_layer = has_own_kv ? L : layer->kv_reuse_layer;
+                gpu_layer_t *kv_gl = &gpu_ctx.layers[kv_src_layer];
+                float attn_scale = m->is_gemma4 ? 1.0f : (1.0f / llm_sqrtf((float)lhd));
+                be->compute.attention(gpu_ctx.d_attn, gpu_ctx.d_q,
+                                      kv_gl->d_k_cache, kv_gl->d_v_cache,
+                                      n_heads, n_kv, lhd,
+                                      pos + 1, max_seq, attn_scale, 0.0f);
+            }
+
+            /* 2f. O projection + post-attn norm + residual (GPU) */
+            void *d_ow = llm_gpu_lookup(layer->o_weight);
+            be->compute.gemv(gpu_ctx.d_ffn_d, d_ow, gpu_ctx.d_attn, dim, lq_dim, layer->o_type);
+
+            if (layer->post_attn_norm && gl->d_post_attn_norm) {
+                be->compute.rmsnorm(gpu_ctx.d_ffn_d, gpu_ctx.d_ffn_d,
+                                    gl->d_post_attn_norm, dim, gpu_ctx.rms_eps);
+            }
+
+            be->compute.add(gpu_ctx.d_x, gpu_ctx.d_x, gpu_ctx.d_ffn_d, dim);
+
+            /* === FFN === */
+
+            /* 2g. Pre-FFN RMSNorm */
+            be->compute.rmsnorm(gpu_ctx.d_xn, gpu_ctx.d_x, gl->d_ffn_norm,
+                                dim, gpu_ctx.rms_eps);
+
+            int lff = layer->ff_dim_layer ? layer->ff_dim_layer : ff;
+
+            /* FFN: always GPU (CPU fallback removed for perf) */
+            if (m->use_gelu || !layer->ffn_gate) {
+                /* GELU FFN */
+                void *d_upw = llm_gpu_lookup(layer->ffn_up);
+                be->compute.gemv(gpu_ctx.d_ffn_u, d_upw, gpu_ctx.d_xn, lff, dim, layer->up_type);
+                be->compute.gelu(gpu_ctx.d_ffn_u, lff);
+                void *d_downw = llm_gpu_lookup(layer->ffn_down);
+                be->compute.gemv(gpu_ctx.d_ffn_d, d_downw, gpu_ctx.d_ffn_u, dim, lff, layer->down_type);
+            } else if (m->use_geglu) {
+                /* GeGLU: GELU(gate) ⊙ up */
+                void *d_gatew = llm_gpu_lookup(layer->ffn_gate);
+                void *d_upw   = llm_gpu_lookup(layer->ffn_up);
+                void *d_downw = llm_gpu_lookup(layer->ffn_down);
+                be->compute.gemv(gpu_ctx.d_ffn_g, d_gatew, gpu_ctx.d_xn, lff, dim, layer->gate_type);
+                be->compute.gemv(gpu_ctx.d_ffn_u, d_upw,   gpu_ctx.d_xn, lff, dim, layer->up_type);
+
+                be->compute.gelu(gpu_ctx.d_ffn_g, lff);
+                be->compute.mul(gpu_ctx.d_ffn_g, gpu_ctx.d_ffn_g, gpu_ctx.d_ffn_u, lff);
+                be->compute.gemv(gpu_ctx.d_ffn_d, d_downw, gpu_ctx.d_ffn_g, dim, lff, layer->down_type);
+            } else {
+                /* SwiGLU: SiLU(gate) ⊙ up */
+                void *d_gatew = llm_gpu_lookup(layer->ffn_gate);
+                void *d_upw   = llm_gpu_lookup(layer->ffn_up);
+                void *d_downw = llm_gpu_lookup(layer->ffn_down);
+                be->compute.gemv(gpu_ctx.d_ffn_g, d_gatew, gpu_ctx.d_xn, lff, dim, layer->gate_type);
+                be->compute.gemv(gpu_ctx.d_ffn_u, d_upw,   gpu_ctx.d_xn, lff, dim, layer->up_type);
+                be->compute.silu(gpu_ctx.d_ffn_g, lff);
+                be->compute.mul(gpu_ctx.d_ffn_g, gpu_ctx.d_ffn_g, gpu_ctx.d_ffn_u, lff);
+                be->compute.gemv(gpu_ctx.d_ffn_d, d_downw, gpu_ctx.d_ffn_g, dim, lff, layer->down_type);
+            }
+
+            /* Post-FFW norm (Gemma4) */
+            if (layer->post_ffw_norm && gl->d_post_ffw_norm) {
+                be->compute.rmsnorm(gpu_ctx.d_ffn_d, gpu_ctx.d_ffn_d,
+                                    gl->d_post_ffw_norm, dim, gpu_ctx.rms_eps);
+            }
+
+            /* Residual */
+            be->compute.add(gpu_ctx.d_x, gpu_ctx.d_x, gpu_ctx.d_ffn_d, dim);
+
+            /* === ISWA injection (Gemma4): GPU-resident === */
+            if (m->is_gemma4 && layer->iswa_inp_gate) {
+                int iswa_d = m->iswa_n_embd;
+                void *d_inp_gate = llm_gpu_lookup(layer->iswa_inp_gate);
+                void *d_proj     = llm_gpu_lookup(layer->iswa_proj);
+
+                if (d_inp_gate && d_proj && gpu_ctx.d_iswa_tmp
+                    && gpu_ctx.d_iswa_per_layer) {
+                    /* All on GPU — no PCIe round-trips */
+                    be->compute.gemv(gpu_ctx.d_iswa_tmp, d_inp_gate, gpu_ctx.d_x,
+                                     iswa_d, dim, layer->iswa_inp_gate_type);
+                    be->compute.gelu(gpu_ctx.d_iswa_tmp, iswa_d);
+                    be->compute.mul(gpu_ctx.d_iswa_tmp, gpu_ctx.d_iswa_tmp,
+                                    gpu_ctx.d_iswa_per_layer + L * iswa_d, iswa_d);
+                    be->compute.gemv(gpu_ctx.d_ffn_d, d_proj, gpu_ctx.d_iswa_tmp,
+                                     dim, iswa_d, layer->iswa_proj_type);
+                    if (gl->d_iswa_post_norm)
+                        be->compute.rmsnorm(gpu_ctx.d_ffn_d, gpu_ctx.d_ffn_d,
+                                            gl->d_iswa_post_norm, dim, gpu_ctx.rms_eps);
+
+                    be->compute.add(gpu_ctx.d_x, gpu_ctx.d_x, gpu_ctx.d_ffn_d, dim);
+                } else {
+                    /* Fallback: CPU hybrid (weight not on GPU) */
+                    be->mem.download(llm_x, gpu_ctx.d_x, (uint64_t)dim * sizeof(float));
+                    { int sa = gpu_ctx.active; gpu_ctx.active = 0;
+                      llm_gemv(llm_iswa_tmp, layer->iswa_inp_gate, llm_x, iswa_d, dim,
+                               layer->iswa_inp_gate_type);
+                      gpu_ctx.active = sa; }
+                    llm_gelu(llm_iswa_tmp, iswa_d);
+                    float *pl = llm_iswa_per_layer + L * iswa_d;
+                    for (int i = 0; i < iswa_d; i++) llm_iswa_tmp[i] *= pl[i];
+                    { int sa = gpu_ctx.active; gpu_ctx.active = 0;
+                      llm_gemv(llm_ffn_d, layer->iswa_proj, llm_iswa_tmp, dim, iswa_d,
+                               layer->iswa_proj_type);
+                      gpu_ctx.active = sa; }
+                    if (layer->iswa_post_norm)
+                        llm_rmsnorm(llm_ffn_d, llm_ffn_d, layer->iswa_post_norm, dim,
+                                    GGML_TYPE_F32, m->rms_eps);
+                    be->mem.upload(gpu_ctx.d_ffn_d, llm_ffn_d, (uint64_t)dim * sizeof(float));
+                    be->compute.add(gpu_ctx.d_x, gpu_ctx.d_x, gpu_ctx.d_ffn_d, dim);
+                }
+            }
+
+            /* Per-layer output scaling (Gemma4) */
+            if (layer->iswa_out_scale) {
+                float s = ((const float *)layer->iswa_out_scale)[0];
+                be->compute.scale(gpu_ctx.d_x, gpu_ctx.d_x, s, dim);
+            }
+
+        }
+
+        /* 3. Final output RMSNorm on GPU (all models) */
+        be->compute.rmsnorm(gpu_ctx.d_xn, gpu_ctx.d_x, gpu_ctx.d_output_norm,
+                            dim, gpu_ctx.rms_eps);
+
+        /* 4. LM head projection on GPU → logits */
+        const void *lm_head = m->output_weight ? m->output_weight : m->token_embd;
+        ggml_type_t lm_type = m->output_weight ? m->output_type : m->token_embd_type;
+        void *d_lm = llm_gpu_lookup(lm_head);
+        if (d_lm) {
+            be->compute.gemv(gpu_ctx.d_out, d_lm, gpu_ctx.d_xn,
+                             m->vocab_size, dim, lm_type);
+            /* Download only the logits */
+            be->mem.download(logits, gpu_ctx.d_out, (uint64_t)m->vocab_size * sizeof(float));
+        } else {
+            /* Fallback: download hidden state and run LM head on CPU */
+            be->mem.download(llm_xn, gpu_ctx.d_xn, (uint64_t)dim * sizeof(float));
+            llm_gemv(logits, lm_head, llm_xn, m->vocab_size, dim, lm_type);
+        }
+
+        /* 5. Logit softcapping (e.g. Gemma4: cap=30.0) */
+        if (m->logit_softcap > 0.0f) {
+            float cap = m->logit_softcap;
+            float inv_cap = 1.0f / cap;
+            for (int i = 0; i < m->vocab_size; i++) {
+                float xv = logits[i] * inv_cap;
+                float e2x = llm_expf(2.0f * xv);
+                logits[i] = cap * (e2x - 1.0f) / (e2x + 1.0f);
+            }
+        }
+
+        return;
+    }
+#endif /* ENABLE_CUDA GPU-resident forward */
+
     llm_embed(llm_x, m, token_id);
 
     /* 2. Process each transformer layer */
@@ -2949,22 +3720,29 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
             float *qh = llm_q + h * lhd;
 
             int seq_len = pos + 1;
+            /* Hoist invariant base addresses out of inner loops */
+            float *k_base = m->k_cache + kv_src_layer * kv_stride + kv_h * hd;
+            float *v_base = m->v_cache + kv_src_layer * kv_stride + kv_h * hd;
+
+            /* Q·K dot products with prefetch */
             for (int t = 0; t < seq_len; t++) {
-                float *kt = m->k_cache + kv_src_layer * kv_stride + t * kv_dim + kv_h * hd;
-                /* Dot product uses lhd (actual head dim for this layer) */
-                float d = llm_dot_f32(qh, kt, lhd);
+                if (t + 2 < seq_len)
+                    __builtin_prefetch(k_base + (t + 2) * kv_dim, 0, 0);
+                float d = llm_dot_f32(qh, k_base + t * kv_dim, lhd);
                 llm_attn_scores[t] = d * attn_scale;
             }
 
             /* Softmax over scores */
             llm_softmax(llm_attn_scores, seq_len);
 
-            /* Weighted sum of V */
+            /* Weighted sum of V with prefetch */
             kmemset(llm_head_buf, 0, lhd * sizeof(float));
             for (int t = 0; t < seq_len; t++) {
                 float s = llm_attn_scores[t];
-                float *vt = m->v_cache + kv_src_layer * kv_stride + t * kv_dim + kv_h * hd;
-                llm_axpy_f32(llm_head_buf, s, vt, lhd);
+                if (s < 1e-7f) continue; /* skip negligible attention weights */
+                if (t + 2 < seq_len)
+                    __builtin_prefetch(v_base + (t + 2) * kv_dim, 0, 0);
+                llm_axpy_f32(llm_head_buf, s, v_base + t * kv_dim, lhd);
             }
 
             kmemcpy(llm_attn_out + h * lhd, llm_head_buf, lhd * sizeof(float));
@@ -3007,8 +3785,11 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
             /* 2h-geglu. GeGLU (Gemma): hidden = GELU(W_gate · x) ⊙ (W_up · x) */
             llm_gemv(llm_ffn_g, layer->ffn_gate, llm_xn, lff, dim, layer->gate_type);
             llm_gemv(llm_ffn_u, layer->ffn_up,   llm_xn, lff, dim, layer->up_type);
+
             llm_gelu(llm_ffn_g, lff);
+
             llm_vmul_f32(llm_ffn_g, llm_ffn_u, lff);
+
             llm_gemv(llm_ffn_d, layer->ffn_down, llm_ffn_g, dim, lff, layer->down_type);
         } else {
             /* 2h. SwiGLU: hidden = SiLU(W_gate · x) ⊙ (W_up · x) */
@@ -3102,6 +3883,7 @@ static void llm_forward_token(llm_model_t *m, float *logits, int token_id, int p
             logits[i] = cap * (e2x - 1.0f) / (e2x + 1.0f);
         }
     }
+
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -3253,9 +4035,23 @@ static int llm_build_vocab(llm_model_t *m, gguf_ctx_t *ctx)
 static int llm_str_match(const char *a, int alen, const char *b, int blen)
 {
     if (alen != blen) return 0;
+    if (llm_jit_mem_equal)
+        return llm_jit_mem_equal(a, b, alen);
     for (int i = 0; i < alen; i++)
         if (a[i] != b[i]) return 0;
     return 1;
+}
+
+/* Find first occurrence of needle in haystack (both null-terminated) */
+static char *llm_strstr(const char *haystack, const char *needle)
+{
+    if (!needle[0]) return (char *)haystack;
+    for (const char *h = haystack; *h; h++) {
+        const char *a = h, *b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return (char *)h;
+    }
+    return (char *)0;
 }
 
 /* FNV-1a hash for (string, length) pairs */
@@ -3469,7 +4265,13 @@ static int llm_tokenize(const llm_model_t *m, const char *text,
     while (pos < text_len && n < max_tokens) {
         /* Scan for next special token pattern */
         int spec_start = -1, spec_end = -1;
-        for (int i = pos; i < text_len - 2; i++) {
+        int i = pos;
+        while (i < text_len - 2) {
+            if (llm_jit_find_byte) {
+                int rel = llm_jit_find_byte(text + i, text_len - i, '<');
+                if (rel < 0) break;
+                i += rel;
+            }
             if (text[i] == '<') {
                 /* Try <|...|> pattern */
                 if (i + 3 < text_len && text[i+1] == '|') {
@@ -3496,6 +4298,7 @@ static int llm_tokenize(const llm_model_t *m, const char *text,
                 }
                 if (spec_start >= 0) break;
             }
+            i++;
         }
 
         if (spec_start < 0) {
@@ -3591,6 +4394,19 @@ static int llm_decode_token(const llm_model_t *m, int token_id,
     char tmp[256];
     kmemcpy(tmp, m->vocab[token_id].str, len);
     tmp[len] = '\0';
+
+    /* Fast path: no GPT-2 remap bytes means we can copy directly. */
+    if (len < max_len) {
+        int has_escape = llm_jit_bpe_escape_scan
+            ? llm_jit_bpe_escape_scan(tmp, len)
+            : 1;
+        if (!has_escape) {
+            kmemcpy(buf, tmp, len);
+            buf[len] = '\0';
+            return len;
+        }
+    }
+
     return llm_bpe_decode(tmp, len, buf, max_len);
 }
 
@@ -3646,9 +4462,57 @@ static void llm_partial_sort_desc(int *indices, const float *vals, int n, int k)
     }
 }
 
-/* Top-k + top-p (nucleus) sampling with temperature */
-static int llm_sample(const float *logits, int vocab_size, float temperature)
+/* ─── Repetition penalty state ─── */
+#define LLM_REP_WINDOW  64   /* track last N tokens */
+#define LLM_REP_PENALTY 1.15f  /* multiplicative penalty for repeated tokens */
+#define LLM_FREQ_PENALTY 0.1f  /* additive penalty scaled by occurrence count */
+static int   llm_rep_ring[LLM_REP_WINDOW];
+static int   llm_rep_count = 0;  /* total tokens pushed */
+
+static void llm_rep_reset(void) { llm_rep_count = 0; kmemset(llm_rep_ring, 0, sizeof(llm_rep_ring)); }
+static void llm_rep_push(int token) { llm_rep_ring[llm_rep_count % LLM_REP_WINDOW] = token; llm_rep_count++; }
+
+/* ─── Thinking mode state ─── */
+#define LLM_THINK_TOKEN    98   /* <|think|> — toggle start/end thinking */
+#define LLM_CHANNEL_START 100   /* <|channel> — Gemma 4 thinking start */
+#define LLM_CHANNEL_END   101   /* <channel|> — Gemma 4 thinking end */
+static int  llm_think_enabled   = 1;   /* 0=off, 1=reactive, 2=force-inject */
+static int  llm_think_show      = 0;   /* 1 = include thinking text in output */
+static int  llm_think_count     = 0;   /* thinking tokens in last generation */
+static int  llm_think_active    = 0;   /* currently inside thinking block */
+
+void llm_set_thinking(int enable)      { llm_think_enabled = enable; }
+void llm_set_show_thinking(int show)   { llm_think_show = show; }
+int  llm_thinking_tokens(void)         { return llm_think_count; }
+
+/* Apply repetition + frequency penalty to logits in-place */
+static void llm_apply_rep_penalty(float *logits, int vocab_size)
 {
+    int window = llm_rep_count < LLM_REP_WINDOW ? llm_rep_count : LLM_REP_WINDOW;
+    if (window == 0) return;
+
+    /* Count occurrences of each token in the window */
+    for (int i = 0; i < window; i++) {
+        int tok = llm_rep_ring[(llm_rep_count - 1 - i) % LLM_REP_WINDOW];
+        if (tok < 0 || tok >= vocab_size) continue;
+
+        /* Multiplicative penalty: shrink logit toward zero */
+        if (logits[tok] > 0)
+            logits[tok] /= LLM_REP_PENALTY;
+        else
+            logits[tok] *= LLM_REP_PENALTY;
+
+        /* Additive frequency penalty based on recency */
+        logits[tok] -= LLM_FREQ_PENALTY;
+    }
+}
+
+/* Top-k + top-p (nucleus) sampling with temperature + repetition penalty */
+static int llm_sample(float *logits, int vocab_size, float temperature)
+{
+    /* Apply repetition penalty before any selection */
+    llm_apply_rep_penalty(logits, vocab_size);
+
     if (temperature <= 0.001f)
         return llm_argmax(logits, vocab_size);
 
@@ -3721,6 +4585,8 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
                         int max_gen, float temperature, int continue_cache)
 {
     int start_pos = 0;
+    int rag_prefix_tokens[LLM_RAG_PREFIX_MAX];
+    int n_rag_prefix = 0;
 
     if (!continue_cache) {
         /* Reset KV cache — fast memset instead of scalar loop */
@@ -3729,6 +4595,24 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
         if (kv_total > llm_alloc_kv_floats) kv_total = llm_alloc_kv_floats;
         kmemset(m->k_cache, 0, (uint64_t)kv_total * sizeof(float));
         kmemset(m->v_cache, 0, (uint64_t)kv_total * sizeof(float));
+#ifdef ENABLE_CUDA
+        /* Clear GPU-resident KV cache */
+        if (gpu_ctx.gpu_fwd) {
+            const backend_t *be = backend_get_by_id(BACKEND_CUDA);
+            for (int L = 0; L < m->n_layers; L++) {
+                llm_layer_t *layer = &m->layers[L];
+                gpu_layer_t *gl = &gpu_ctx.layers[L];
+                if (layer->kv_reuse_layer < 0 && gl->d_k_cache) {
+                    /* Use per-layer lhd -- NOT global head_dim (avoids overflow for lhd=256 layers) */
+                    int lhd = gl->lhd ? gl->lhd : m->head_dim;
+                    uint64_t kv_layer_bytes = (uint64_t)m->n_kv_heads * m->max_seq * lhd * sizeof(float);
+                    be->mem.upload(gl->d_k_cache, m->k_cache, kv_layer_bytes);
+                    be->mem.upload(gl->d_v_cache, m->v_cache, kv_layer_bytes);
+                }
+            }
+        }
+#endif
+        llm_rep_reset();
     } else {
         start_pos = m->cache_len;
     }
@@ -3737,8 +4621,36 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
     int gen_count = 0;
     output_text[0] = '\0';
 
+    /* Reset thinking state for this generation */
+    llm_think_count  = 0;
+    llm_think_active = 0;
+
+    /* Seed repetition window with prompt tokens */
+    for (int i = 0; i < n_prompt; i++)
+        llm_rep_push(prompt_tokens[i]);
+
+    if (!continue_cache && llm_rag_prefix.active && llm_rag_prefix.emb &&
+        llm_rag_prefix.dim == m->dim) {
+        n_rag_prefix = llm_rag_prefix.n_prefix;
+        if (n_rag_prefix > LLM_RAG_PREFIX_MAX) n_rag_prefix = LLM_RAG_PREFIX_MAX;
+        for (int i = 0; i < n_rag_prefix; i++) {
+            const float *e = llm_rag_prefix.emb + (uint64_t)i * m->dim;
+            int tid = llm_rag_embedding_to_token(m, e);
+            if (tid < 0) {
+                n_rag_prefix = i;
+                break;
+            }
+            rag_prefix_tokens[i] = tid;
+            llm_rep_push(tid);
+        }
+    }
+
     /* Process prompt tokens (prefill) */
     uint64_t t_prefill_start = rdtsc_fenced();
+    for (int i = 0; i < n_rag_prefix && (start_pos + i) < m->max_seq - 1; i++) {
+        llm_forward_token(m, llm_logits, rag_prefix_tokens[i], start_pos + i);
+    }
+    start_pos += n_rag_prefix;
     for (int i = 0; i < n_prompt && (start_pos + i) < m->max_seq - 1; i++) {
         llm_forward_token(m, llm_logits, prompt_tokens[i], start_pos + i);
     }
@@ -3750,6 +4662,7 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
 
     /* Get next token from the last forward pass */
     int next = llm_sample(llm_logits, m->vocab_size, temperature);
+    LOG_DBG("GEN", "first sampled token: %d (eos=%d)", next, m->eos_id);
 
     uint64_t t_gen_start = rdtsc_fenced();
     int consec_nl = 0;  /* consecutive newline counter */
@@ -3757,10 +4670,130 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
     for (int g = 0; g < max_gen && pos < m->max_seq; g++) {
         /* Check for EOS BEFORE decoding its text */
         if (next == m->eos_id) break;
-        /* Gemma turn marker (106 = <turn|>) always signals end of response */
-        if (next == 106) break;
+        /* Gemma turn marker (106 = <turn|>) always signals end of response.
+         * Forward the token so the KV cache includes it for multi-turn. */
+        if (next == 106) {
+            llm_forward_token(m, llm_logits, next, pos);
+            pos++;
+            break;
+        }
 
-        /* Decode token to text */
+        /* ── Thinking mode: detect <|think|> toggle (token 98) ────────── */
+        if (next == LLM_THINK_TOKEN && llm_think_enabled) {
+            if (!llm_think_active) {
+                /* Entering thinking block */
+                llm_think_active = 1;
+                LOG_INFO("THINK", "thinking started at token %d", gen_count);
+                if (llm_think_show) {
+                    const char *tag = "<think>\n";
+                    int tl = 8;
+                    for (int i = 0; i < tl && out_pos < max_text_len - 1; i++)
+                        output_text[out_pos++] = tag[i];
+                    output_text[out_pos] = '\0';
+                    if (llm_stream_cb)
+                        llm_stream_cb(tag, tl, llm_stream_cb_ud);
+                }
+            } else {
+                /* Exiting thinking block */
+                llm_think_active = 0;
+                LOG_INFO("THINK", "thinking ended: %d thinking tokens", llm_think_count);
+                if (llm_think_show) {
+                    const char *tag = "\n</think>\n";
+                    int tl = 10;
+                    for (int i = 0; i < tl && out_pos < max_text_len - 1; i++)
+                        output_text[out_pos++] = tag[i];
+                    output_text[out_pos] = '\0';
+                    if (llm_stream_cb)
+                        llm_stream_cb(tag, tl, llm_stream_cb_ud);
+                }
+            }
+            /* Forward the think token through the transformer (keeps KV cache consistent) */
+            llm_forward_token(m, llm_logits, next, pos);
+            pos++;
+            gen_count++;
+            llm_rep_push(next);
+            next = llm_sample(llm_logits, m->vocab_size, temperature);
+            continue;
+        }
+
+        /* ── Gemma channel thinking: <|channel> (100) starts, <channel|> (101) ends ── */
+        if (next == LLM_CHANNEL_START && llm_think_enabled && !llm_think_active) {
+            llm_think_active = 1;
+            LOG_INFO("THINK", "channel thinking started at token %d", gen_count);
+            if (llm_think_show) {
+                const char *tag = "<think>\n";
+                int tl = 8;
+                for (int i = 0; i < tl && out_pos < max_text_len - 1; i++)
+                    output_text[out_pos++] = tag[i];
+                output_text[out_pos] = '\0';
+                if (llm_stream_cb)
+                    llm_stream_cb(tag, tl, llm_stream_cb_ud);
+            }
+            llm_forward_token(m, llm_logits, next, pos);
+            pos++;
+            gen_count++;
+            llm_rep_push(next);
+            next = llm_sample(llm_logits, m->vocab_size, temperature);
+            continue;
+        }
+        if (next == LLM_CHANNEL_END && llm_think_active) {
+            llm_think_active = 0;
+            LOG_INFO("THINK", "channel thinking ended: %d thinking tokens", llm_think_count);
+            if (llm_think_show) {
+                const char *tag = "\n</think>\n";
+                int tl = 10;
+                for (int i = 0; i < tl && out_pos < max_text_len - 1; i++)
+                    output_text[out_pos++] = tag[i];
+                output_text[out_pos] = '\0';
+                if (llm_stream_cb)
+                    llm_stream_cb(tag, tl, llm_stream_cb_ud);
+            }
+            llm_forward_token(m, llm_logits, next, pos);
+            pos++;
+            gen_count++;
+            llm_rep_push(next);
+            next = llm_sample(llm_logits, m->vocab_size, temperature);
+            continue;
+        }
+
+        /* ── Inside thinking: pure token-space operation ──────────────── */
+        if (llm_think_active) {
+            /* Skip detokenization entirely — just forward and sample */
+            llm_think_count++;
+            if (llm_think_show) {
+                /* Optionally detokenize for display */
+                char tok_buf[128];
+                int tok_len = llm_decode_token(m, next, tok_buf, sizeof(tok_buf));
+                for (int i = 0; i < tok_len && out_pos < max_text_len - 1; i++)
+                    output_text[out_pos++] = tok_buf[i];
+                output_text[out_pos] = '\0';
+                if (llm_stream_cb && tok_len > 0) {
+                    char stream_buf[128];
+                    int si = 0;
+                    for (int i = 0; i < tok_len; ) {
+                        unsigned char c = (unsigned char)tok_buf[i];
+                        if (c == 0xE2 && i + 2 < tok_len &&
+                            (unsigned char)tok_buf[i+1] == 0x96 &&
+                            (unsigned char)tok_buf[i+2] == 0x81) {
+                            stream_buf[si++] = ' ';
+                            i += 3;
+                        } else {
+                            stream_buf[si++] = tok_buf[i++];
+                        }
+                    }
+                    if (si > 0) llm_stream_cb(stream_buf, si, llm_stream_cb_ud);
+                }
+            }
+            LOG_TRC("THINK", "think tok %d: id=%d", llm_think_count, next);
+            llm_forward_token(m, llm_logits, next, pos);
+            pos++;
+            gen_count++;
+            llm_rep_push(next);
+            next = llm_sample(llm_logits, m->vocab_size, temperature);
+            continue;
+        }
+
+        /* ── Normal token: decode to text ─────────────────────────────── */
         char tok_buf[128];
         int tok_len = llm_decode_token(m, next, tok_buf, sizeof(tok_buf));
         for (int i = 0; i < tok_len && out_pos < max_text_len - 1; i++)
@@ -3786,14 +4819,18 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
             if (si > 0) llm_stream_cb(stream_buf, si, llm_stream_cb_ud);
         }
 
-        /* Check for <|im_end|> or <|endoftext|> in recent text */
-        if (out_pos >= 10) {
-            const char *tail = output_text + out_pos - 10;
+        /* Check for known stop sequences in recent text */
+        if (out_pos >= 4) {
+            static const char *stop_seqs[] = {
+                "<|im_end|>", "<|endoftext|>", "<|end|>",
+                "<|eot_id|>", "<|end_of_turn|>", NULL
+            };
             int stop = 0;
-            for (int s = 0; s < 10 && !stop; s++) {
-                if (tail[s] == '<' && tail[s+1] == '|') {
+            for (int si = 0; stop_seqs[si] && !stop; si++) {
+                const char *found = llm_strstr(output_text, stop_seqs[si]);
+                if (found) {
                     stop = 1;
-                    int trunc_at = (int)(tail - output_text) + s;
+                    int trunc_at = (int)(found - output_text);
                     output_text[trunc_at] = '\0';
                     out_pos = trunc_at;
                 }
@@ -3817,16 +4854,22 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
 
         /* Sample next token */
         last_token = next;
+        llm_rep_push(next);
         next = llm_sample(llm_logits, m->vocab_size, temperature);
     }
     uint64_t t_gen_end = rdtsc_fenced();
 
-    /* Final cleanup: strip any <|...|> artifacts from output */
+    /* Final cleanup: strip any known stop sequence artifacts from output */
     {
-        for (int i = 0; i + 1 < out_pos; i++) {
-            if (output_text[i] == '<' && output_text[i+1] == '|') {
-                output_text[i] = '\0';
-                out_pos = i;
+        static const char *stop_seqs[] = {
+            "<|im_end|>", "<|endoftext|>", "<|end|>",
+            "<|eot_id|>", "<|end_of_turn|>", NULL
+        };
+        for (int si = 0; stop_seqs[si]; si++) {
+            char *found = llm_strstr(output_text, stop_seqs[si]);
+            if (found) {
+                *found = '\0';
+                out_pos = (int)(found - output_text);
                 break;
             }
         }
@@ -3842,14 +4885,153 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
     if (gen_count > 0) {
         uint64_t prefill_us = perf_cycles_to_us(t_prefill_end - t_prefill_start);
         uint64_t gen_us = perf_cycles_to_us(t_gen_end - t_gen_start);
-        uint64_t ms_per_tok = gen_us / (uint64_t)gen_count / 1000;
-        kprintf("\n[%d tok, %lu ms/tok, prefill %lu ms, %d cpus]\n",
-                gen_count, (unsigned long)ms_per_tok,
-                (unsigned long)(prefill_us / 1000),
-                smp.ap_started + 1);
+        float tok_per_s = gen_us > 0 ? (float)gen_count * 1000000.0f / (float)gen_us : 0.0f;
+        llm_last_prefill_ms_val  = (float)(prefill_us / 1000);
+        llm_last_tok_per_sec_val = tok_per_s;
+        int visible_tok = gen_count - llm_think_count;
+        if (llm_think_count > 0) {
+            kprintf("\n[%d tok (%d think + %d visible), %.1f tok/s, prefill %lu ms, %d cpus]\n",
+                    gen_count, llm_think_count, visible_tok, tok_per_s,
+                    (unsigned long)(prefill_us / 1000),
+                    smp.ap_started + 1);
+        } else {
+            kprintf("\n[%d tok, %.1f tok/s, prefill %lu ms, %d cpus]\n",
+                    gen_count, tok_per_s,
+                    (unsigned long)(prefill_us / 1000),
+                    smp.ap_started + 1);
+        }
+        LOG_DBG("GEN", "generation complete: %d tokens, %.1f tok/s, "
+                "prefill=%lu us, gen=%lu us, think=%d",
+                gen_count, tok_per_s,
+                (unsigned long)prefill_us, (unsigned long)gen_us,
+                llm_think_count);
     }
 
     return gen_count;
+}
+
+static int llm_generate_token_ids(llm_model_t *m, const int *prompt_tokens, int n_prompt,
+                                  int *output_tokens, int max_output_tokens,
+                                  int max_gen, float temperature, int continue_cache)
+{
+    int start_pos = 0;
+    int emitted_count = 0;
+    int total_generated = 0;
+
+    if (!continue_cache) {
+        m->cache_len = 0;
+        {
+            int kv_total = m->n_layers * m->max_seq * m->n_kv_heads * m->head_dim;
+            if (kv_total > llm_alloc_kv_floats) kv_total = llm_alloc_kv_floats;
+            kmemset(m->k_cache, 0, (uint64_t)kv_total * sizeof(float));
+            kmemset(m->v_cache, 0, (uint64_t)kv_total * sizeof(float));
+        }
+#ifdef ENABLE_CUDA
+        if (gpu_ctx.gpu_fwd) {
+            const backend_t *be = backend_get_by_id(BACKEND_CUDA);
+            for (int L = 0; L < m->n_layers; L++) {
+                llm_layer_t *layer = &m->layers[L];
+                gpu_layer_t *gl = &gpu_ctx.layers[L];
+                if (layer->kv_reuse_layer < 0 && gl->d_k_cache) {
+                    int lhd = gl->lhd ? gl->lhd : m->head_dim;
+                    uint64_t kv_layer_bytes = (uint64_t)m->n_kv_heads * m->max_seq * lhd * sizeof(float);
+                    be->mem.upload(gl->d_k_cache, m->k_cache, kv_layer_bytes);
+                    be->mem.upload(gl->d_v_cache, m->v_cache, kv_layer_bytes);
+                }
+            }
+        }
+#endif
+        llm_rep_reset();
+    } else {
+        start_pos = m->cache_len;
+    }
+
+    llm_think_count = 0;
+    llm_think_active = 0;
+
+    for (int i = 0; i < n_prompt; i++)
+        llm_rep_push(prompt_tokens[i]);
+
+    {
+        uint64_t t_prefill_start = rdtsc_fenced();
+        for (int i = 0; i < n_prompt && (start_pos + i) < m->max_seq - 1; i++)
+            llm_forward_token(m, llm_logits, prompt_tokens[i], start_pos + i);
+        uint64_t t_prefill_end = rdtsc_fenced();
+
+        int pos = start_pos + n_prompt;
+        int next = llm_sample(llm_logits, m->vocab_size, temperature);
+        uint64_t t_gen_start = rdtsc_fenced();
+
+        for (int g = 0; g < max_gen && pos < m->max_seq && emitted_count < max_output_tokens; g++) {
+            if (next == m->eos_id) break;
+            if (next == 106) {
+                llm_forward_token(m, llm_logits, next, pos);
+                pos++;
+                total_generated++;
+                break;
+            }
+
+            if (next == LLM_THINK_TOKEN && llm_think_enabled) {
+                llm_think_active = !llm_think_active;
+                llm_forward_token(m, llm_logits, next, pos);
+                pos++;
+                total_generated++;
+                llm_rep_push(next);
+                next = llm_sample(llm_logits, m->vocab_size, temperature);
+                continue;
+            }
+
+            if (next == LLM_CHANNEL_START && llm_think_enabled && !llm_think_active) {
+                llm_think_active = 1;
+                llm_forward_token(m, llm_logits, next, pos);
+                pos++;
+                total_generated++;
+                llm_rep_push(next);
+                next = llm_sample(llm_logits, m->vocab_size, temperature);
+                continue;
+            }
+
+            if (next == LLM_CHANNEL_END && llm_think_active) {
+                llm_think_active = 0;
+                llm_forward_token(m, llm_logits, next, pos);
+                pos++;
+                total_generated++;
+                llm_rep_push(next);
+                next = llm_sample(llm_logits, m->vocab_size, temperature);
+                continue;
+            }
+
+            if (llm_think_active) {
+                llm_think_count++;
+                llm_forward_token(m, llm_logits, next, pos);
+                pos++;
+                total_generated++;
+                llm_rep_push(next);
+                next = llm_sample(llm_logits, m->vocab_size, temperature);
+                continue;
+            }
+
+            output_tokens[emitted_count++] = next;
+            total_generated++;
+
+            llm_forward_token(m, llm_logits, next, pos);
+            pos++;
+            llm_rep_push(next);
+            next = llm_sample(llm_logits, m->vocab_size, temperature);
+        }
+
+        m->cache_len = pos;
+
+        if (total_generated > 0) {
+            uint64_t prefill_us = perf_cycles_to_us(t_prefill_end - t_prefill_start);
+            uint64_t gen_us = perf_cycles_to_us(rdtsc_fenced() - t_gen_start);
+            float tok_per_s = gen_us > 0 ? (float)total_generated * 1000000.0f / (float)gen_us : 0.0f;
+            llm_last_prefill_ms_val = (float)(prefill_us / 1000);
+            llm_last_tok_per_sec_val = tok_per_s;
+        }
+    }
+
+    return emitted_count;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -4473,6 +5655,11 @@ static int llm_init_parsed_model(llm_model_t *m)
     if (rc != 0) return rc;
     kprintf("[LLM] Vocab built (%d tokens), allocating scratch...\n", m->n_vocab);
 
+    /* Initialize tokenizer/detokenizer JIT helper kernels. */
+    llm_jit_mem_equal = jit_compile_mem_equal_kernel();
+    llm_jit_bpe_escape_scan = jit_compile_bpe_escape_scan_kernel();
+    llm_jit_find_byte = jit_compile_find_byte_kernel();
+
     /* Final vocab_size sanity: prefer tokenizer count over GGUF metadata */
     if (m->n_vocab > 0 && m->n_vocab != m->vocab_size) {
         kprintf("[LLM] Vocab: metadata=%d, tokenizer=%d, using %d\n",
@@ -4896,6 +6083,30 @@ const char *llm_model_name(void)
     return llm_model.name;
 }
 
+const char *llm_model_arch(void)
+{
+    if (!llm_is_loaded()) return "(none)";
+    return llm_model.arch;
+}
+
+int llm_model_layers(void)
+{
+    if (!llm_is_loaded()) return 0;
+    return llm_model.n_layers;
+}
+
+int llm_model_dim(void)
+{
+    if (!llm_is_loaded()) return 0;
+    return llm_model.dim;
+}
+
+int llm_model_vocab(void)
+{
+    if (!llm_is_loaded()) return 0;
+    return llm_model.vocab_size;
+}
+
 uint64_t llm_param_count(void)
 {
     if (!llm_is_loaded()) return 0;
@@ -4928,6 +6139,21 @@ llm_backend_t llm_get_backend(void)
     return llm_backend;
 }
 
+int llm_last_vram_usage_mb(void)
+{
+    return llm_last_vram_mb;
+}
+
+float llm_last_prefill_ms(void)
+{
+    return llm_last_prefill_ms_val;
+}
+
+float llm_last_tok_per_sec(void)
+{
+    return llm_last_tok_per_sec_val;
+}
+
 const char *llm_backend_name(void)
 {
     switch (llm_backend) {
@@ -4938,11 +6164,1284 @@ const char *llm_backend_name(void)
     }
 }
 
+int llm_tokenize_text(const char *text, int *tokens, int max_tokens)
+{
+    if (!llm_is_loaded() || !text || !tokens || max_tokens <= 0) return -1;
+    return llm_tokenize(&llm_model, text, tokens, max_tokens);
+}
+
+int llm_decode_tokens(const int *tokens, int n_tokens, char *output, int max_output)
+{
+    if (!llm_is_loaded() || !output || max_output <= 0) return -1;
+    return llm_decode_tokens_to_text(&llm_model, tokens, n_tokens, output, max_output);
+}
+
+static const char *llm_exec_skip_ws(const char *p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    return p;
+}
+
+typedef struct {
+    int64_t num;
+    int64_t den;
+} llm_exec_rational_t;
+
+typedef struct {
+    const llm_model_t *m;
+    const int *tokens;
+    int n_tokens;
+    int token_idx;
+    int char_idx;
+    char tok_buf[128];
+    int tok_len;
+} llm_exec_tokcur_t;
+
+static int64_t llm_exec_abs64(int64_t x)
+{
+    return x < 0 ? -x : x;
+}
+
+static int64_t llm_exec_gcd64(int64_t a, int64_t b)
+{
+    a = llm_exec_abs64(a);
+    b = llm_exec_abs64(b);
+    while (b != 0) {
+        int64_t t = a % b;
+        a = b;
+        b = t;
+    }
+    return a == 0 ? 1 : a;
+}
+
+static int llm_exec_rational_norm(llm_exec_rational_t *r)
+{
+    if (!r || r->den == 0) return -1;
+    if (r->den < 0) {
+        r->num = -r->num;
+        r->den = -r->den;
+    }
+    if (r->num == 0) {
+        r->den = 1;
+        return 0;
+    }
+    {
+        int64_t g = llm_exec_gcd64(r->num, r->den);
+        r->num /= g;
+        r->den /= g;
+    }
+    return 0;
+}
+
+static int llm_exec_rational_add(llm_exec_rational_t a, llm_exec_rational_t b,
+                                 llm_exec_rational_t *out)
+{
+    int64_t g = llm_exec_gcd64(a.den, b.den);
+    int64_t ad = a.den / g;
+    int64_t bd = b.den / g;
+    __int128 num = (__int128)a.num * bd + (__int128)b.num * ad;
+    __int128 den = (__int128)a.den * bd;
+    out->num = (int64_t)num;
+    out->den = (int64_t)den;
+    return llm_exec_rational_norm(out);
+}
+
+static int llm_exec_rational_sub(llm_exec_rational_t a, llm_exec_rational_t b,
+                                 llm_exec_rational_t *out)
+{
+    b.num = -b.num;
+    return llm_exec_rational_add(a, b, out);
+}
+
+static int llm_exec_rational_mul(llm_exec_rational_t a, llm_exec_rational_t b,
+                                 llm_exec_rational_t *out)
+{
+    int64_t g1 = llm_exec_gcd64(a.num, b.den);
+    int64_t g2 = llm_exec_gcd64(b.num, a.den);
+    __int128 num = (__int128)(a.num / g1) * (b.num / g2);
+    __int128 den = (__int128)(a.den / g2) * (b.den / g1);
+    out->num = (int64_t)num;
+    out->den = (int64_t)den;
+    return llm_exec_rational_norm(out);
+}
+
+static int llm_exec_rational_div(llm_exec_rational_t a, llm_exec_rational_t b,
+                                 llm_exec_rational_t *out)
+{
+    if (b.num == 0) return -1;
+    {
+        llm_exec_rational_t inv;
+        inv.num = b.den;
+        inv.den = b.num;
+        if (llm_exec_rational_norm(&inv) != 0) return -1;
+        return llm_exec_rational_mul(a, inv, out);
+    }
+}
+
+static int llm_exec_tokcur_load(llm_exec_tokcur_t *c)
+{
+    if (!c) return -1;
+    while (c->token_idx < c->n_tokens) {
+        int n = llm_decode_token(c->m, c->tokens[c->token_idx], c->tok_buf,
+                                 (int)sizeof(c->tok_buf));
+        c->token_idx++;
+        c->char_idx = 0;
+        c->tok_len = n > 0 ? n : 0;
+        if (c->tok_len > 0) return 0;
+    }
+    c->tok_len = 0;
+    return -1;
+}
+
+static int llm_exec_tokcur_peek(llm_exec_tokcur_t *c)
+{
+    if (!c) return -1;
+    while (c->char_idx >= c->tok_len) {
+        if (llm_exec_tokcur_load(c) != 0)
+            return -1;
+    }
+    return (uint8_t)c->tok_buf[c->char_idx];
+}
+
+static int llm_exec_tokcur_get(llm_exec_tokcur_t *c)
+{
+    int ch = llm_exec_tokcur_peek(c);
+    if (ch < 0) return -1;
+    c->char_idx++;
+    return ch;
+}
+
+static void llm_exec_tokcur_skip_ws(llm_exec_tokcur_t *c)
+{
+    for (;;) {
+        int ch = llm_exec_tokcur_peek(c);
+        if (ch < 0) break;
+        if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') break;
+        (void)llm_exec_tokcur_get(c);
+    }
+}
+
+static int llm_exec_tokcur_has_tail(llm_exec_tokcur_t *c)
+{
+    llm_exec_tokcur_skip_ws(c);
+    return llm_exec_tokcur_peek(c) >= 0;
+}
+
+static int llm_exec_parse_number_tok(llm_exec_tokcur_t *c,
+                                     llm_exec_rational_t *out)
+{
+    int saw_digit = 0;
+    int saw_dot = 0;
+    int64_t int_part = 0;
+    int64_t frac_part = 0;
+    int64_t frac_scale = 1;
+
+    for (;;) {
+        int ch = llm_exec_tokcur_peek(c);
+        if (ch < '0' || ch > '9') break;
+        saw_digit = 1;
+        int_part = int_part * 10 + (ch - '0');
+        (void)llm_exec_tokcur_get(c);
+    }
+
+    if (llm_exec_tokcur_peek(c) == '.') {
+        saw_dot = 1;
+        (void)llm_exec_tokcur_get(c);
+        for (;;) {
+            int ch = llm_exec_tokcur_peek(c);
+            if (ch < '0' || ch > '9') break;
+            saw_digit = 1;
+            frac_part = frac_part * 10 + (ch - '0');
+            frac_scale *= 10;
+            (void)llm_exec_tokcur_get(c);
+        }
+    }
+
+    if (!saw_digit) return -1;
+
+    if (saw_dot) {
+        out->num = int_part * frac_scale + frac_part;
+        out->den = frac_scale;
+    } else {
+        out->num = int_part;
+        out->den = 1;
+    }
+
+    llm_exec_tokcur_skip_ws(c);
+    if (llm_exec_tokcur_peek(c) == '/') {
+        int64_t den = 0;
+        int saw_den = 0;
+        (void)llm_exec_tokcur_get(c);
+        llm_exec_tokcur_skip_ws(c);
+        for (;;) {
+            int ch = llm_exec_tokcur_peek(c);
+            if (ch < '0' || ch > '9') break;
+            saw_den = 1;
+            den = den * 10 + (ch - '0');
+            (void)llm_exec_tokcur_get(c);
+        }
+        if (!saw_den || den == 0) return -1;
+        out->den *= den;
+    }
+
+    return llm_exec_rational_norm(out);
+}
+
+static int llm_exec_parse_expr_tok(llm_exec_tokcur_t *c,
+                                   llm_exec_rational_t *out);
+
+static int llm_exec_parse_factor_tok(llm_exec_tokcur_t *c,
+                                     llm_exec_rational_t *out)
+{
+    int sign = 1;
+    llm_exec_tokcur_skip_ws(c);
+    {
+        int ch = llm_exec_tokcur_peek(c);
+        if (ch == '+' || ch == '-') {
+            if (ch == '-') sign = -1;
+            (void)llm_exec_tokcur_get(c);
+        }
+    }
+
+    llm_exec_tokcur_skip_ws(c);
+    if (llm_exec_tokcur_peek(c) == '(') {
+        (void)llm_exec_tokcur_get(c);
+        if (llm_exec_parse_expr_tok(c, out) != 0) return -1;
+        llm_exec_tokcur_skip_ws(c);
+        if (llm_exec_tokcur_get(c) != ')') return -1;
+        out->num *= sign;
+        return llm_exec_rational_norm(out);
+    }
+
+    if (llm_exec_parse_number_tok(c, out) != 0) return -1;
+    out->num *= sign;
+    return llm_exec_rational_norm(out);
+}
+
+static int llm_exec_parse_term_tok(llm_exec_tokcur_t *c,
+                                   llm_exec_rational_t *out)
+{
+    llm_exec_rational_t rhs;
+    if (llm_exec_parse_factor_tok(c, out) != 0) return -1;
+
+    for (;;) {
+        int ch;
+        llm_exec_tokcur_skip_ws(c);
+        ch = llm_exec_tokcur_peek(c);
+        if (ch != '*' && ch != '/') break;
+        (void)llm_exec_tokcur_get(c);
+        if (llm_exec_parse_factor_tok(c, &rhs) != 0) return -1;
+        if (ch == '*') {
+            if (llm_exec_rational_mul(*out, rhs, out) != 0) return -1;
+        } else {
+            if (llm_exec_rational_div(*out, rhs, out) != 0) return -1;
+        }
+    }
+    return 0;
+}
+
+static int llm_exec_parse_expr_tok(llm_exec_tokcur_t *c,
+                                   llm_exec_rational_t *out)
+{
+    llm_exec_rational_t rhs;
+    if (llm_exec_parse_term_tok(c, out) != 0) return -1;
+
+    for (;;) {
+        int ch;
+        llm_exec_tokcur_skip_ws(c);
+        ch = llm_exec_tokcur_peek(c);
+        if (ch != '+' && ch != '-') break;
+        (void)llm_exec_tokcur_get(c);
+        if (llm_exec_parse_term_tok(c, &rhs) != 0) return -1;
+        if (ch == '+') {
+            if (llm_exec_rational_add(*out, rhs, out) != 0) return -1;
+        } else {
+            if (llm_exec_rational_sub(*out, rhs, out) != 0) return -1;
+        }
+    }
+    return 0;
+}
+
+static int llm_exec_i64_to_str(int64_t v, char *out, int max_len)
+{
+    int pos = 0;
+    if (!out || max_len <= 1) return -1;
+    if (v == 0) {
+        out[0] = '0';
+        out[1] = '\0';
+        return 1;
+    }
+    if (v < 0) {
+        if (pos >= max_len - 1) return -1;
+        out[pos++] = '-';
+    }
+    {
+        uint64_t u = (uint64_t)(v < 0 ? -v : v);
+        char tmp[32];
+        int t = 0;
+        while (u > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = (char)('0' + (u % 10));
+            u /= 10;
+        }
+        while (t > 0 && pos < max_len - 1)
+            out[pos++] = tmp[--t];
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
+static int llm_exec_rational_to_tokens(const llm_exec_rational_t *r,
+                                       int *output_tokens, int max_output_tokens)
+{
+    char out[96];
+    int n;
+    if (!r || !output_tokens || max_output_tokens <= 0) return -1;
+
+    if (r->den == 1) {
+        n = llm_exec_i64_to_str(r->num, out, (int)sizeof(out));
+        if (n <= 0) return -1;
+    } else {
+        int a = llm_exec_i64_to_str(r->num, out, (int)sizeof(out));
+        if (a <= 0 || a >= (int)sizeof(out) - 1) return -1;
+        out[a++] = '/';
+        n = llm_exec_i64_to_str(r->den, out + a, (int)sizeof(out) - a);
+        if (n <= 0) return -1;
+    }
+    return llm_tokenize(&llm_model, out, output_tokens, max_output_tokens);
+}
+
+static int llm_exec_json_parse_value(llm_exec_tokcur_t *c, int depth);
+
+static int llm_exec_json_expect_literal(llm_exec_tokcur_t *c, const char *lit)
+{
+    int i = 0;
+    while (lit[i]) {
+        int ch = llm_exec_tokcur_get(c);
+        if (ch != lit[i]) return -1;
+        i++;
+    }
+    return 0;
+}
+
+static int llm_exec_json_parse_string(llm_exec_tokcur_t *c)
+{
+    if (llm_exec_tokcur_get(c) != '"') return -1;
+    for (;;) {
+        int ch = llm_exec_tokcur_get(c);
+        if (ch < 0) return -1;
+        if (ch == '"') return 0;
+        if ((uint8_t)ch < 0x20) return -1;
+        if (ch == '\\') {
+            int esc = llm_exec_tokcur_get(c);
+            if (esc < 0) return -1;
+            if (esc == '"' || esc == '\\' || esc == '/' || esc == 'b' ||
+                esc == 'f' || esc == 'n' || esc == 'r' || esc == 't') {
+                continue;
+            }
+            if (esc == 'u') {
+                for (int i = 0; i < 4; i++) {
+                    int hx = llm_exec_tokcur_get(c);
+                    if (!((hx >= '0' && hx <= '9') ||
+                          (hx >= 'a' && hx <= 'f') ||
+                          (hx >= 'A' && hx <= 'F'))) {
+                        return -1;
+                    }
+                }
+                continue;
+            }
+            return -1;
+        }
+    }
+}
+
+static int llm_exec_json_parse_number(llm_exec_tokcur_t *c)
+{
+    int ch = llm_exec_tokcur_peek(c);
+    int saw_digit = 0;
+
+    if (ch == '-') {
+        (void)llm_exec_tokcur_get(c);
+        ch = llm_exec_tokcur_peek(c);
+    }
+
+    if (ch == '0') {
+        saw_digit = 1;
+        (void)llm_exec_tokcur_get(c);
+        ch = llm_exec_tokcur_peek(c);
+    } else {
+        while (ch >= '0' && ch <= '9') {
+            saw_digit = 1;
+            (void)llm_exec_tokcur_get(c);
+            ch = llm_exec_tokcur_peek(c);
+        }
+    }
+    if (!saw_digit) return -1;
+
+    if (ch == '.') {
+        int saw_frac = 0;
+        (void)llm_exec_tokcur_get(c);
+        ch = llm_exec_tokcur_peek(c);
+        while (ch >= '0' && ch <= '9') {
+            saw_frac = 1;
+            (void)llm_exec_tokcur_get(c);
+            ch = llm_exec_tokcur_peek(c);
+        }
+        if (!saw_frac) return -1;
+    }
+
+    if (ch == 'e' || ch == 'E') {
+        int saw_exp = 0;
+        (void)llm_exec_tokcur_get(c);
+        ch = llm_exec_tokcur_peek(c);
+        if (ch == '+' || ch == '-') {
+            (void)llm_exec_tokcur_get(c);
+            ch = llm_exec_tokcur_peek(c);
+        }
+        while (ch >= '0' && ch <= '9') {
+            saw_exp = 1;
+            (void)llm_exec_tokcur_get(c);
+            ch = llm_exec_tokcur_peek(c);
+        }
+        if (!saw_exp) return -1;
+    }
+
+    return 0;
+}
+
+static int llm_exec_json_parse_array(llm_exec_tokcur_t *c, int depth)
+{
+    if (llm_exec_tokcur_get(c) != '[') return -1;
+    llm_exec_tokcur_skip_ws(c);
+    if (llm_exec_tokcur_peek(c) == ']') {
+        (void)llm_exec_tokcur_get(c);
+        return 0;
+    }
+
+    for (;;) {
+        if (llm_exec_json_parse_value(c, depth + 1) != 0) return -1;
+        llm_exec_tokcur_skip_ws(c);
+        {
+            int ch = llm_exec_tokcur_get(c);
+            if (ch == ']') return 0;
+            if (ch != ',') return -1;
+        }
+        llm_exec_tokcur_skip_ws(c);
+    }
+}
+
+static int llm_exec_json_parse_object(llm_exec_tokcur_t *c, int depth)
+{
+    if (llm_exec_tokcur_get(c) != '{') return -1;
+    llm_exec_tokcur_skip_ws(c);
+    if (llm_exec_tokcur_peek(c) == '}') {
+        (void)llm_exec_tokcur_get(c);
+        return 0;
+    }
+
+    for (;;) {
+        if (llm_exec_json_parse_string(c) != 0) return -1;
+        llm_exec_tokcur_skip_ws(c);
+        if (llm_exec_tokcur_get(c) != ':') return -1;
+        llm_exec_tokcur_skip_ws(c);
+        if (llm_exec_json_parse_value(c, depth + 1) != 0) return -1;
+        llm_exec_tokcur_skip_ws(c);
+        {
+            int ch = llm_exec_tokcur_get(c);
+            if (ch == '}') return 0;
+            if (ch != ',') return -1;
+        }
+        llm_exec_tokcur_skip_ws(c);
+        if (llm_exec_tokcur_peek(c) != '"') return -1;
+    }
+}
+
+static int llm_exec_json_parse_value(llm_exec_tokcur_t *c, int depth)
+{
+    int ch;
+    if (depth > 256) return -1;
+
+    llm_exec_tokcur_skip_ws(c);
+    ch = llm_exec_tokcur_peek(c);
+    if (ch < 0) return -1;
+
+    if (ch == '"') return llm_exec_json_parse_string(c);
+    if (ch == '{') return llm_exec_json_parse_object(c, depth);
+    if (ch == '[') return llm_exec_json_parse_array(c, depth);
+    if (ch == 't') return llm_exec_json_expect_literal(c, "true");
+    if (ch == 'f') return llm_exec_json_expect_literal(c, "false");
+    if (ch == 'n') return llm_exec_json_expect_literal(c, "null");
+    return llm_exec_json_parse_number(c);
+}
+
+static int llm_exec_parse_expr(const char **pp, int *ok);
+
+static int llm_exec_parse_factor(const char **pp, int *ok)
+{
+    const char *p = llm_exec_skip_ws(*pp);
+    int sign = 1;
+    if (*p == '+') { p++; }
+    else if (*p == '-') { sign = -1; p++; }
+
+    p = llm_exec_skip_ws(p);
+    if (*p == '(') {
+        p++;
+        int v = llm_exec_parse_expr(&p, ok);
+        p = llm_exec_skip_ws(p);
+        if (*p != ')') { *ok = 0; return 0; }
+        p++;
+        *pp = p;
+        return sign * v;
+    }
+
+    if (*p < '0' || *p > '9') { *ok = 0; return 0; }
+    int v = 0;
+    while (*p >= '0' && *p <= '9') {
+        v = v * 10 + (*p - '0');
+        p++;
+    }
+    *pp = p;
+    return sign * v;
+}
+
+static int llm_exec_parse_term(const char **pp, int *ok)
+{
+    int v = llm_exec_parse_factor(pp, ok);
+    if (!*ok) return 0;
+    const char *p = *pp;
+    for (;;) {
+        p = llm_exec_skip_ws(p);
+        if (*p != '*' && *p != '/') break;
+        char op = *p++;
+        int rhs = llm_exec_parse_factor(&p, ok);
+        if (!*ok) return 0;
+        if (op == '*') v *= rhs;
+        else {
+            if (rhs == 0) { *ok = 0; return 0; }
+            v /= rhs;
+        }
+    }
+    *pp = p;
+    return v;
+}
+
+static int llm_exec_parse_expr(const char **pp, int *ok)
+{
+    int v = llm_exec_parse_term(pp, ok);
+    if (!*ok) return 0;
+    const char *p = *pp;
+    for (;;) {
+        p = llm_exec_skip_ws(p);
+        if (*p != '+' && *p != '-') break;
+        char op = *p++;
+        int rhs = llm_exec_parse_term(&p, ok);
+        if (!*ok) return 0;
+        if (op == '+') v += rhs;
+        else v -= rhs;
+    }
+    *pp = p;
+    return v;
+}
+
+static int llm_exec_builtin_arith(const int *input_tokens, int n_input_tokens,
+                                  int *output_tokens, int max_output_tokens)
+{
+    char expr[512];
+    char out[64];
+    int n = llm_decode_tokens_to_text(&llm_model, input_tokens, n_input_tokens, expr, sizeof(expr));
+    if (n <= 0) return -1;
+
+    int ok = 1;
+    const char *p = expr;
+    int val = llm_exec_parse_expr(&p, &ok);
+    p = llm_exec_skip_ws(p);
+    if (!ok || *p != '\0') return -1;
+
+    int pos = 0;
+    if (val == 0) {
+        out[pos++] = '0';
+    } else {
+        int neg = val < 0;
+        unsigned int u = (unsigned int)(neg ? -val : val);
+        char tmp[32];
+        int t = 0;
+        while (u > 0 && t < (int)sizeof(tmp)) {
+            tmp[t++] = (char)('0' + (u % 10));
+            u /= 10;
+        }
+        if (neg) out[pos++] = '-';
+        while (t > 0 && pos < (int)sizeof(out) - 1) out[pos++] = tmp[--t];
+    }
+    out[pos] = '\0';
+
+    return llm_tokenize(&llm_model, out, output_tokens, max_output_tokens);
+}
+
+static int llm_exec_builtin_arith_token_native(const int *input_tokens,
+                                               int n_input_tokens,
+                                               int *output_tokens,
+                                               int max_output_tokens)
+{
+    llm_exec_tokcur_t c;
+    llm_exec_rational_t v;
+
+    if (!llm_is_loaded() || !input_tokens || n_input_tokens <= 0) return -1;
+
+    kmemset(&c, 0, sizeof(c));
+    c.m = &llm_model;
+    c.tokens = input_tokens;
+    c.n_tokens = n_input_tokens;
+
+    if (llm_exec_parse_expr_tok(&c, &v) != 0) return -1;
+    if (llm_exec_tokcur_has_tail(&c)) return -1;
+
+    return llm_exec_rational_to_tokens(&v, output_tokens, max_output_tokens);
+}
+
+int llm_execute_token_program(const int *input_tokens, int n_input_tokens,
+                              llm_token_exec_fn executor, void *userdata,
+                              int *output_tokens, int max_output_tokens)
+{
+    if (!output_tokens || max_output_tokens <= 0) return -1;
+    if (executor)
+        return executor(input_tokens, n_input_tokens, output_tokens, max_output_tokens, userdata);
+
+    if (!llm_is_loaded() || !input_tokens || n_input_tokens <= 0) return -1;
+
+    /* Prefer token-native parser/executor: no full detokenize-retokenize loop. */
+    {
+        int rc = llm_exec_builtin_arith_token_native(input_tokens, n_input_tokens,
+                                                     output_tokens, max_output_tokens);
+        if (rc >= 0) return rc;
+    }
+
+    /* Legacy fallback for tokenizations that don't expose arithmetic chars cleanly. */
+    return llm_exec_builtin_arith(input_tokens, n_input_tokens,
+                                  output_tokens, max_output_tokens);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Token-native code execution loop
+ *
+ * Generates model output, feeds it to the executor, reinjects executor
+ * response as a continuation prompt — all in pure token-ID space.
+ * No text serialization at any machine-to-machine boundary.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int llm_execute_token_loop(const int *prompt_tokens, int n_prompt,
+                           llm_token_exec_fn executor, void *userdata,
+                           int *output_tokens, int max_output_tokens,
+                           int max_gen, float temperature,
+                           int max_rounds)
+{
+    int gen_buf_cap = max_gen > 0 ? max_gen : 256;
+    int *gen_buf   = NULL;
+    int *cur_prompt = NULL;
+    int  cur_prompt_len = 0;
+    int  total_out = 0;
+    int  round;
+
+    if (!llm_is_loaded()) return -1;
+    if (!prompt_tokens || n_prompt <= 0) return -1;
+    if (!output_tokens || max_output_tokens <= 0) return -1;
+    if (!executor) return -1;
+    if (max_rounds <= 0) max_rounds = 8;
+    if (max_gen <= 0) max_gen = 256;
+
+    gen_buf = (int *)kmalloc(gen_buf_cap * sizeof(int));
+    cur_prompt = (int *)kmalloc(n_prompt * sizeof(int));
+    if (!gen_buf || !cur_prompt) {
+        if (gen_buf) kfree(gen_buf);
+        if (cur_prompt) kfree(cur_prompt);
+        return -1;
+    }
+    kmemcpy(cur_prompt, prompt_tokens, n_prompt * sizeof(int));
+    cur_prompt_len = n_prompt;
+
+    for (round = 0; round < max_rounds; round++) {
+        int n_gen, n_exec;
+        int *exec_out;
+        int exec_cap;
+
+        /* Step 1: generate from current prompt (token-native) */
+        n_gen = llm_generate_tokens(cur_prompt, cur_prompt_len,
+                                    gen_buf, gen_buf_cap,
+                                    max_gen, temperature,
+                                    round > 0 ? 1 : 0);
+        if (n_gen <= 0) break;
+
+        /* Copy generated tokens to final output if space allows */
+        {
+            int copy = n_gen;
+            if (total_out + copy > max_output_tokens)
+                copy = max_output_tokens - total_out;
+            if (copy > 0) {
+                kmemcpy(output_tokens + total_out, gen_buf, copy * sizeof(int));
+                total_out += copy;
+            }
+        }
+
+        /* Step 2: pass generated tokens to executor (token-native: no text) */
+        exec_cap = gen_buf_cap;
+        exec_out = (int *)kmalloc(exec_cap * sizeof(int));
+        if (!exec_out) break;
+
+        n_exec = executor(gen_buf, n_gen, exec_out, exec_cap, userdata);
+
+        if (n_exec <= 0) {
+            /* Executor returned nothing → loop terminates cleanly */
+            kfree(exec_out);
+            break;
+        }
+
+        /* Copy executor output to final output if space allows */
+        {
+            int copy = n_exec;
+            if (total_out + copy > max_output_tokens)
+                copy = max_output_tokens - total_out;
+            if (copy > 0) {
+                kmemcpy(output_tokens + total_out, exec_out, copy * sizeof(int));
+                total_out += copy;
+            }
+        }
+
+        /* Step 3: reinject executor output as new prompt for the next round */
+        kfree(cur_prompt);
+        cur_prompt = exec_out;   /* ownership transferred */
+        cur_prompt_len = n_exec;
+    }
+
+    kfree(gen_buf);
+    kfree(cur_prompt);
+    return total_out;
+}
+
+int llm_validate_json_tokens(const int *tokens, int n_tokens)
+{
+    llm_exec_tokcur_t c;
+
+    if (!llm_is_loaded() || !tokens || n_tokens <= 0) return -1;
+
+    kmemset(&c, 0, sizeof(c));
+    c.m = &llm_model;
+    c.tokens = tokens;
+    c.n_tokens = n_tokens;
+
+    if (llm_exec_json_parse_value(&c, 0) != 0)
+        return 0;
+
+    llm_exec_tokcur_skip_ws(&c);
+    return llm_exec_tokcur_peek(&c) < 0 ? 1 : 0;
+}
+
+int llm_validate_code_fence_tokens(const int *tokens, int n_tokens)
+{
+    llm_exec_tokcur_t c;
+    int ticks = 0;
+    int in_body = 0;
+
+    if (!llm_is_loaded() || !tokens || n_tokens <= 0) return -1;
+
+    kmemset(&c, 0, sizeof(c));
+    c.m = &llm_model;
+    c.tokens = tokens;
+    c.n_tokens = n_tokens;
+
+    llm_exec_tokcur_skip_ws(&c);
+
+    /* Opening fence: exactly three backticks after optional leading whitespace. */
+    while (ticks < 3) {
+        int ch = llm_exec_tokcur_get(&c);
+        if (ch != '`') return 0;
+        ticks++;
+    }
+
+    /* Optional language hint until newline. */
+    for (;;) {
+        int ch = llm_exec_tokcur_get(&c);
+        if (ch < 0) return 0;
+        if (ch == '\n' || ch == '\r') break;
+    }
+
+    in_body = 1;
+    while (in_body) {
+        int ch = llm_exec_tokcur_get(&c);
+        if (ch < 0) return 0;
+        if (ch == '`') {
+            int t = 1;
+            while (t < 3) {
+                int nx = llm_exec_tokcur_get(&c);
+                if (nx != '`') {
+                    t = 0;
+                    break;
+                }
+                t++;
+            }
+            if (t == 3) {
+                in_body = 0;
+                break;
+            }
+        }
+    }
+
+    llm_exec_tokcur_skip_ws(&c);
+    return llm_exec_tokcur_peek(&c) < 0 ? 1 : 0;
+}
+
+static int llm_xml_name_start(int ch)
+{
+    return ((ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            ch == '_' || ch == ':');
+}
+
+static int llm_xml_name_char(int ch)
+{
+    return llm_xml_name_start(ch) ||
+           (ch >= '0' && ch <= '9') ||
+           ch == '-' || ch == '.';
+}
+
+int llm_validate_xml_tokens(const int *tokens, int n_tokens)
+{
+    llm_exec_tokcur_t c;
+    enum { XML_MAX_DEPTH = 64, XML_MAX_TAG = 64 };
+    char stack[XML_MAX_DEPTH][XML_MAX_TAG];
+    int depth = 0;
+    int saw_root = 0;
+
+    if (!llm_is_loaded() || !tokens || n_tokens <= 0) return -1;
+
+    kmemset(&c, 0, sizeof(c));
+    c.m = &llm_model;
+    c.tokens = tokens;
+    c.n_tokens = n_tokens;
+
+    while (llm_exec_tokcur_peek(&c) >= 0) {
+        int ch = llm_exec_tokcur_get(&c);
+        if (ch < 0) break;
+
+        if (ch != '<') continue;
+
+        ch = llm_exec_tokcur_get(&c);
+        if (ch < 0) return 0;
+
+        if (ch == '!') {
+            int p1 = llm_exec_tokcur_get(&c);
+            int p2 = llm_exec_tokcur_get(&c);
+            if (p1 == '-' && p2 == '-') {
+                /* Comment: consume until --> */
+                int a = 0, b = 0;
+                for (;;) {
+                    int q = llm_exec_tokcur_get(&c);
+                    if (q < 0) return 0;
+                    a = b;
+                    b = q;
+                    if (a == '-' && b == '-' && llm_exec_tokcur_peek(&c) == '>') {
+                        (void)llm_exec_tokcur_get(&c);
+                        break;
+                    }
+                }
+            } else {
+                /* DOCTYPE/CDATA/etc: consume to next '>' */
+                for (;;) {
+                    int q = llm_exec_tokcur_get(&c);
+                    if (q < 0) return 0;
+                    if (q == '>') break;
+                }
+            }
+            continue;
+        }
+
+        if (ch == '?') {
+            /* Processing instruction: consume until ?> */
+            int prev = 0;
+            for (;;) {
+                int q = llm_exec_tokcur_get(&c);
+                if (q < 0) return 0;
+                if (prev == '?' && q == '>') break;
+                prev = q;
+            }
+            continue;
+        }
+
+        if (ch == '/') {
+            char name[XML_MAX_TAG];
+            int ni = 0;
+            int top;
+
+            ch = llm_exec_tokcur_get(&c);
+            if (!llm_xml_name_start(ch)) return 0;
+            while (ch >= 0 && llm_xml_name_char(ch)) {
+                if (ni + 1 < XML_MAX_TAG) name[ni++] = (char)ch;
+                ch = llm_exec_tokcur_get(&c);
+            }
+            name[ni] = '\0';
+
+            while (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r')
+                ch = llm_exec_tokcur_get(&c);
+            if (ch != '>') return 0;
+            if (depth <= 0) return 0;
+
+            top = depth - 1;
+            if (!llm_str_match(stack[top], (int)kstrlen(stack[top]), name, ni)) return 0;
+            depth--;
+            continue;
+        }
+
+        if (!llm_xml_name_start(ch)) return 0;
+        {
+            char name[XML_MAX_TAG];
+            int ni = 0;
+            int self_close = 0;
+            int prev = 0;
+
+            while (ch >= 0 && llm_xml_name_char(ch)) {
+                if (ni + 1 < XML_MAX_TAG) name[ni++] = (char)ch;
+                ch = llm_exec_tokcur_get(&c);
+            }
+            name[ni] = '\0';
+
+            /* Consume attributes until end of tag, honoring quotes. */
+            {
+                int quote = 0;
+                while (ch >= 0) {
+                    if (!quote && (ch == '"' || ch == '\'')) {
+                        quote = ch;
+                    } else if (quote && ch == quote) {
+                        quote = 0;
+                    } else if (!quote && ch == '>') {
+                        self_close = (prev == '/');
+                        break;
+                    }
+                    prev = ch;
+                    ch = llm_exec_tokcur_get(&c);
+                }
+                if (ch != '>') return 0;
+            }
+
+            saw_root = 1;
+            if (!self_close) {
+                if (depth >= XML_MAX_DEPTH) return 0;
+                kmemset(stack[depth], 0, XML_MAX_TAG);
+                kmemcpy(stack[depth], name, (uint64_t)ni);
+                depth++;
+            }
+        }
+    }
+
+    return (saw_root && depth == 0) ? 1 : 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Schema-lite key:value validator   (token-native, no text boundary)
+ *
+ * Accepted grammar per line:
+ *   LINE     ::= BLANK | COMMENT | KV_PAIR
+ *   BLANK    ::= WS* NL
+ *   COMMENT  ::= WS* '#' [^\n]* NL
+ *   KV_PAIR  ::= KEY WS* SEP WS* VALUE NL
+ *   KEY      ::= [a-zA-Z0-9_\-\.]+
+ *   SEP      ::= ':' | '=' | '::'
+ *   VALUE    ::= [^\n]+   (non-empty)
+ *
+ * Covers simple config / INI / YAML-lite patterns.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int llm_validate_key_value_tokens(const int *tokens, int n_tokens)
+{
+    llm_exec_tokcur_t c;
+    int saw_pair = 0;
+
+    if (!llm_is_loaded() || !tokens || n_tokens <= 0) return -1;
+
+    kmemset(&c, 0, sizeof(c));
+    c.m = &llm_model;
+    c.tokens = tokens;
+    c.n_tokens = n_tokens;
+
+    for (;;) {
+        int ch = llm_exec_tokcur_peek(&c);
+        if (ch < 0) break; /* EOF → done */
+
+        /* blank line */
+        if (ch == '\n' || ch == '\r') {
+            (void)llm_exec_tokcur_get(&c);
+            continue;
+        }
+
+        /* skip leading whitespace */
+        while (ch == ' ' || ch == '\t') {
+            (void)llm_exec_tokcur_get(&c);
+            ch = llm_exec_tokcur_peek(&c);
+        }
+        if (ch < 0) break;
+
+        /* blank line after whitespace */
+        if (ch == '\n' || ch == '\r') {
+            (void)llm_exec_tokcur_get(&c);
+            continue;
+        }
+
+        /* comment line */
+        if (ch == '#') {
+            while (ch >= 0 && ch != '\n' && ch != '\r')  {
+                (void)llm_exec_tokcur_get(&c);
+                ch = llm_exec_tokcur_peek(&c);
+            }
+            if (ch >= 0) (void)llm_exec_tokcur_get(&c);
+            continue;
+        }
+
+        /* key: must start with alphanumeric or _ */
+        {
+            int key_len = 0;
+            while (ch >= 0 &&
+                   ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                    (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.')) {
+                key_len++;
+                (void)llm_exec_tokcur_get(&c);
+                ch = llm_exec_tokcur_peek(&c);
+            }
+            if (key_len == 0) return 0; /* invalid: no key */
+        }
+
+        /* skip whitespace before separator */
+        while (ch == ' ' || ch == '\t') {
+            (void)llm_exec_tokcur_get(&c);
+            ch = llm_exec_tokcur_peek(&c);
+        }
+
+        /* separator: ':', '=', or '::' */
+        if (ch == ':') {
+            (void)llm_exec_tokcur_get(&c);
+            ch = llm_exec_tokcur_peek(&c);
+            if (ch == ':') { /* '::' */
+                (void)llm_exec_tokcur_get(&c);
+                ch = llm_exec_tokcur_peek(&c);
+            }
+        } else if (ch == '=') {
+            (void)llm_exec_tokcur_get(&c);
+            ch = llm_exec_tokcur_peek(&c);
+        } else {
+            return 0; /* missing separator */
+        }
+
+        /* skip whitespace after separator */
+        while (ch == ' ' || ch == '\t') {
+            (void)llm_exec_tokcur_get(&c);
+            ch = llm_exec_tokcur_peek(&c);
+        }
+
+        /* value: at least one non-newline char */
+        {
+            int val_len = 0;
+            while (ch >= 0 && ch != '\n' && ch != '\r') {
+                val_len++;
+                (void)llm_exec_tokcur_get(&c);
+                ch = llm_exec_tokcur_peek(&c);
+            }
+            if (val_len == 0) return 0; /* empty value */
+        }
+
+        saw_pair = 1;
+        if (ch >= 0) (void)llm_exec_tokcur_get(&c); /* consume newline */
+    }
+
+    return saw_pair ? 1 : 0;
+}
+
+int llm_generate_tokens(const int *prompt_tokens, int n_prompt,
+                        int *output_tokens, int max_output_tokens,
+                        int max_gen, float temperature, int continue_cache)
+{
+    if (!llm_is_loaded()) return -1;
+    if (!output_tokens || max_output_tokens <= 0 || max_gen <= 0) return -1;
+    if (__sync_lock_test_and_set(&llm_inference_active, 1)) return -1;
+
+    {
+        int n_gen = llm_generate_token_ids(&llm_model, prompt_tokens, n_prompt,
+                                           output_tokens, max_output_tokens,
+                                           max_gen, temperature, continue_cache);
+        __sync_lock_release(&llm_inference_active);
+        return n_gen;
+    }
+}
+
+int llm_prompt_tokens(const char *user_text, int *output_tokens,
+                      int max_output_tokens, int max_gen, float temperature)
+{
+    if (!llm_is_loaded() || !user_text || !output_tokens || max_output_tokens <= 0)
+        return -1;
+
+    llm_model_t *m = &llm_model;
+    static char prompt_buf[2048];
+    int pos = 0;
+    const int buf_max = (int)sizeof(prompt_buf) - 1;
+
+    #define TOKEN_PROMPT_APPEND(s) do { \
+        const char *_s = (s); int _l = kstrlen(_s); \
+        if (pos + _l > buf_max) _l = buf_max - pos; \
+        if (_l > 0) { kmemcpy(prompt_buf + pos, _s, _l); pos += _l; } \
+    } while (0)
+
+    {
+        int is_chatml = 0;
+        int is_phi3 = 0;
+        int is_phi2 = 0;
+        int is_gemma = 0;
+        if (kstrlen(m->arch) >= 4 &&
+            m->arch[0] == 'q' && m->arch[1] == 'w' &&
+            m->arch[2] == 'e' && m->arch[3] == 'n')
+            is_chatml = 1;
+        if (kstrlen(m->arch) >= 3 &&
+            m->arch[0] == 'p' && m->arch[1] == 'h' && m->arch[2] == 'i') {
+            if (m->arch[3] == '2' || m->arch[3] == '\0')
+                is_phi2 = 1;
+            else
+                is_phi3 = 1;
+        }
+        if (kstrlen(m->arch) >= 5 &&
+            m->arch[0] == 'g' && m->arch[1] == 'e' &&
+            m->arch[2] == 'm' && m->arch[3] == 'm' && m->arch[4] == 'a')
+            is_gemma = 1;
+
+        if (is_phi3) {
+            TOKEN_PROMPT_APPEND("<|user|>\n");
+            TOKEN_PROMPT_APPEND(user_text);
+            TOKEN_PROMPT_APPEND("<|end|>\n<|assistant|>\n");
+        } else if (is_phi2) {
+            TOKEN_PROMPT_APPEND("Instruct: ");
+            TOKEN_PROMPT_APPEND(user_text);
+            TOKEN_PROMPT_APPEND("\nOutput: ");
+        } else if (is_chatml) {
+            TOKEN_PROMPT_APPEND("<|im_start|>system\nYou are a helpful AI assistant running on TensorOS, a bare-metal AI operating system.<|im_end|>\n<|im_start|>user\n");
+            TOKEN_PROMPT_APPEND(user_text);
+            TOKEN_PROMPT_APPEND("<|im_end|>\n<|im_start|>assistant\n");
+        } else if (is_gemma) {
+            TOKEN_PROMPT_APPEND("<turn|>user\n");
+            TOKEN_PROMPT_APPEND(user_text);
+            TOKEN_PROMPT_APPEND("\n<turn|>model\n");
+        } else {
+            TOKEN_PROMPT_APPEND("User: ");
+            TOKEN_PROMPT_APPEND(user_text);
+            TOKEN_PROMPT_APPEND("\nAssistant: ");
+        }
+    }
+
+    prompt_buf[pos] = '\0';
+    #undef TOKEN_PROMPT_APPEND
+
+    {
+        int n_tokens = llm_tokenize(m, prompt_buf, llm_tokens + 1, llm_alloc_tokens - 65);
+        if (n_tokens > 0 && m->bos_id >= 0) {
+            llm_tokens[0] = m->bos_id;
+            n_tokens++;
+        } else {
+            for (int i = 0; i < n_tokens; i++)
+                llm_tokens[i] = llm_tokens[i + 1];
+        }
+        if (n_tokens <= 0) return -1;
+        if (max_gen < 1) max_gen = 256;
+        return llm_generate_tokens(llm_tokens, n_tokens, output_tokens,
+                                   max_output_tokens, max_gen, temperature, 0);
+    }
+}
+
+int llm_chat_turn_tokens(const char *user_text, int *output_tokens,
+                         int max_output_tokens, int max_gen, float temperature)
+{
+    if (!llm_is_loaded() || !user_text || !output_tokens || max_output_tokens <= 0)
+        return -1;
+
+    llm_model_t *m = &llm_model;
+    int first_turn = (m->cache_len == 0);
+    static char turn_buf[4096];
+    int pos = 0;
+    const int buf_max = (int)sizeof(turn_buf) - 1;
+
+    #define TOKEN_CHAT_APPEND(s) do { \
+        const char *_s = (s); int _l = kstrlen(_s); \
+        if (pos + _l > buf_max) _l = buf_max - pos; \
+        if (_l > 0) { kmemcpy(turn_buf + pos, _s, _l); pos += _l; } \
+    } while (0)
+
+    {
+        int is_gemma = kstrlen(m->arch) >= 5 &&
+            m->arch[0]=='g' && m->arch[1]=='e' && m->arch[2]=='m' &&
+            m->arch[3]=='m' && m->arch[4]=='a';
+        int is_phi3 = kstrlen(m->arch) >= 3 &&
+            m->arch[0]=='p' && m->arch[1]=='h' && m->arch[2]=='i' &&
+            m->arch[3] != '2' && m->arch[3] != '\0';
+        int is_phi2 = kstrlen(m->arch) >= 3 &&
+            m->arch[0]=='p' && m->arch[1]=='h' && m->arch[2]=='i' &&
+            (m->arch[3] == '2' || m->arch[3] == '\0');
+        int is_chatml = kstrlen(m->arch) >= 4 &&
+            m->arch[0]=='q' && m->arch[1]=='w' && m->arch[2]=='e' && m->arch[3]=='n';
+
+        if (is_gemma) {
+            TOKEN_CHAT_APPEND("<|turn>user\n");
+            TOKEN_CHAT_APPEND(user_text);
+            TOKEN_CHAT_APPEND("<turn|>\n<|turn>model\n");
+        } else if (is_phi3) {
+            TOKEN_CHAT_APPEND("<|user|>\n");
+            TOKEN_CHAT_APPEND(user_text);
+            TOKEN_CHAT_APPEND("<|end|>\n<|assistant|>\n");
+        } else if (is_phi2) {
+            TOKEN_CHAT_APPEND("Instruct: ");
+            TOKEN_CHAT_APPEND(user_text);
+            TOKEN_CHAT_APPEND("\nOutput: ");
+        } else if (is_chatml) {
+            if (first_turn)
+                TOKEN_CHAT_APPEND("<|im_start|>system\nYou are a helpful AI assistant.<|im_end|>\n");
+            TOKEN_CHAT_APPEND("<|im_start|>user\n");
+            TOKEN_CHAT_APPEND(user_text);
+            TOKEN_CHAT_APPEND("<|im_end|>\n<|im_start|>assistant\n");
+        } else {
+            TOKEN_CHAT_APPEND(user_text);
+            TOKEN_CHAT_APPEND("\n");
+        }
+    }
+
+    turn_buf[pos] = '\0';
+    #undef TOKEN_CHAT_APPEND
+
+    {
+        int n_tokens = llm_tokenize(m, turn_buf, llm_tokens + 1, llm_alloc_tokens - 65);
+        if (first_turn && m->bos_id >= 0) {
+            llm_tokens[0] = m->bos_id;
+            n_tokens++;
+        } else {
+            for (int i = 0; i < n_tokens; i++)
+                llm_tokens[i] = llm_tokens[i + 1];
+        }
+        if (n_tokens <= 0) return -1;
+        if (llm_think_enabled >= 2 &&
+            kstrlen(m->arch) >= 5 && m->arch[0]=='g' && m->arch[1]=='e' &&
+            m->arch[2]=='m' && m->arch[3]=='m' && m->arch[4]=='a' &&
+            n_tokens < llm_alloc_tokens - 2)
+            llm_tokens[n_tokens++] = LLM_THINK_TOKEN;
+        if (max_gen < 1) max_gen = 256;
+        return llm_generate_tokens(llm_tokens, n_tokens, output_tokens,
+                                   max_output_tokens, max_gen, temperature,
+                                   first_turn ? 0 : 1);
+    }
+}
+
 int llm_prompt(const char *user_text, char *output, int max_output)
 {
     if (!llm_is_loaded()) {
         kstrlcpy(output, "[no model loaded]", max_output);
         return -1;
+    }
+
+    if (!llm_stream_cb && !llm_think_show) {
+        int n_gen = llm_prompt_tokens(user_text, llm_tokens, llm_alloc_tokens, 1024, 0.7f);
+        if (n_gen < 0) {
+            kstrlcpy(output, "[generation failed]", max_output);
+            return -1;
+        }
+        llm_decode_tokens(llm_tokens, n_gen, output, max_output);
+        return n_gen;
     }
 
     /* Serialize: only one inference at a time (static buffers not reentrant) */
@@ -5038,6 +7537,18 @@ int llm_prompt_n(const char *user_text, char *output, int max_output, int max_to
         kstrlcpy(output, "[no model loaded]", max_output);
         return -1;
     }
+
+    if (!llm_stream_cb && !llm_think_show) {
+        int n_gen = llm_prompt_tokens(user_text, llm_tokens, llm_alloc_tokens,
+                                      max_tokens > 0 ? max_tokens : 16, 0.0f);
+        if (n_gen < 0) {
+            kstrlcpy(output, "[generation failed]", max_output);
+            return -1;
+        }
+        llm_decode_tokens(llm_tokens, n_gen, output, max_output);
+        return n_gen;
+    }
+
     if (__sync_lock_test_and_set(&llm_inference_active, 1)) {
         kstrlcpy(output, "[inference busy]", max_output);
         return -1;
@@ -5105,6 +7616,16 @@ int llm_prompt_n(const char *user_text, char *output, int max_output, int max_to
         for (int i = 0; i < n_tokens; i++)
             llm_tokens[i] = llm_tokens[i + 1];
     }
+
+    /* Inject <|think|> token for models that support thinking.
+     * Only inject when llm_think_enabled == 2 (force-think mode).
+     * Default (1) = detect and handle organically when model emits it. */
+    if (llm_think_enabled >= 2 && is_gemma && n_tokens > 0 &&
+        n_tokens < llm_alloc_tokens - 2) {
+        llm_tokens[n_tokens++] = LLM_THINK_TOKEN;
+        LOG_DBG("THINK", "force-injected <|think|> token into prompt");
+    }
+
     if (n_tokens <= 0) {
         __sync_lock_release(&llm_inference_active);
         kstrlcpy(output, "[tokenization failed]", max_output);
@@ -5113,7 +7634,7 @@ int llm_prompt_n(const char *user_text, char *output, int max_output, int max_to
 
     if (max_tokens < 1) max_tokens = 16;
     int n_gen = llm_generate(m, llm_tokens, n_tokens, output, max_output,
-                             max_tokens, 0.0f, 0); /* greedy for smoke test */
+                             max_tokens, 0.0f, 0); /* greedy for debug */
     __sync_lock_release(&llm_inference_active);
     return n_gen;
 }
@@ -5128,6 +7649,364 @@ void llm_reset_cache(void)
     if (kv_total > llm_alloc_kv_floats) kv_total = llm_alloc_kv_floats;
     kmemset(m->k_cache, 0, (uint64_t)kv_total * sizeof(float));
     kmemset(m->v_cache, 0, (uint64_t)kv_total * sizeof(float));
+#ifdef ENABLE_CUDA
+    if (gpu_ctx.gpu_fwd) {
+        const backend_t *be = backend_get_by_id(BACKEND_CUDA);
+        uint64_t kv_layer_bytes = (uint64_t)m->n_kv_heads * m->max_seq * m->head_dim * sizeof(float);
+        for (int L = 0; L < m->n_layers; L++) {
+            if (m->layers[L].kv_reuse_layer < 0 && gpu_ctx.layers[L].d_k_cache) {
+                be->mem.upload(gpu_ctx.layers[L].d_k_cache, m->k_cache, kv_layer_bytes);
+                be->mem.upload(gpu_ctx.layers[L].d_v_cache, m->v_cache, kv_layer_bytes);
+            }
+        }
+    }
+#endif
+}
+
+int llm_kv_snapshot_prefix(const int *prefix_tokens, int n_prefix_tokens)
+{
+    llm_model_t *m;
+    int kv_dim, layer_stride, snap_layer_stride;
+    int capture_len;
+    int slot_i = -1;
+    uint32_t prefix_hash;
+
+    if (!llm_is_loaded() || !prefix_tokens || n_prefix_tokens <= 0) return -1;
+
+    m = &llm_model;
+    if (m->cache_len <= 0) return -1;
+
+    capture_len = n_prefix_tokens;
+    if (capture_len > m->cache_len) capture_len = m->cache_len;
+    if (capture_len <= 0) return -1;
+
+    prefix_hash = llm_hash_tokens(prefix_tokens, n_prefix_tokens);
+
+    for (int i = 0; i < LLM_KV_SNAPSHOT_SLOTS; i++) {
+        if (llm_kv_snapshot_prefix_match(&llm_kv_snapshots[i], prefix_tokens,
+                                         n_prefix_tokens, prefix_hash)) {
+            slot_i = i;
+            break;
+        }
+    }
+    if (slot_i < 0) {
+        for (int i = 0; i < LLM_KV_SNAPSHOT_SLOTS; i++) {
+            if (!llm_kv_snapshots[i].in_use) {
+                slot_i = i;
+                break;
+            }
+        }
+    }
+    if (slot_i < 0) {
+        slot_i = llm_kv_snapshot_evict;
+        llm_kv_snapshot_evict = (llm_kv_snapshot_evict + 1) % LLM_KV_SNAPSHOT_SLOTS;
+    }
+
+    llm_kv_snapshot_clear_slot(&llm_kv_snapshots[slot_i]);
+
+    kv_dim = m->n_kv_heads * m->head_dim;
+    layer_stride = m->max_seq * kv_dim;
+    snap_layer_stride = capture_len * kv_dim;
+
+    {
+        llm_kv_snapshot_slot_t *s = &llm_kv_snapshots[slot_i];
+        uint64_t token_bytes = (uint64_t)n_prefix_tokens * sizeof(int);
+        uint64_t cache_bytes = (uint64_t)m->n_layers * snap_layer_stride * sizeof(float);
+
+        s->prefix_tokens = (int *)tensor_alloc(token_bytes);
+        s->k_cache = (float *)tensor_alloc(cache_bytes);
+        s->v_cache = (float *)tensor_alloc(cache_bytes);
+        if (!s->prefix_tokens || !s->k_cache || !s->v_cache) {
+            llm_kv_snapshot_clear_slot(s);
+            return -1;
+        }
+
+        kmemcpy(s->prefix_tokens, prefix_tokens, token_bytes);
+        for (int L = 0; L < m->n_layers; L++) {
+            const float *src_k = m->k_cache + (uint64_t)L * layer_stride;
+            const float *src_v = m->v_cache + (uint64_t)L * layer_stride;
+            float *dst_k = s->k_cache + (uint64_t)L * snap_layer_stride;
+            float *dst_v = s->v_cache + (uint64_t)L * snap_layer_stride;
+            kmemcpy(dst_k, src_k, (uint64_t)snap_layer_stride * sizeof(float));
+            kmemcpy(dst_v, src_v, (uint64_t)snap_layer_stride * sizeof(float));
+        }
+
+        s->in_use = 1;
+        s->prefix_hash = prefix_hash;
+        s->n_prefix_tokens = n_prefix_tokens;
+        s->cached_len = capture_len;
+        s->n_layers = m->n_layers;
+        s->max_seq = m->max_seq;
+        s->n_kv_heads = m->n_kv_heads;
+        s->head_dim = m->head_dim;
+    }
+
+    return capture_len;
+}
+
+int llm_kv_restore_prefix(const int *prefix_tokens, int n_prefix_tokens)
+{
+    llm_model_t *m;
+    llm_kv_snapshot_slot_t *s = (llm_kv_snapshot_slot_t *)0;
+    uint32_t prefix_hash;
+    int kv_dim, layer_stride, snap_layer_stride;
+
+    if (!llm_is_loaded() || !prefix_tokens || n_prefix_tokens <= 0) return -1;
+
+    m = &llm_model;
+    prefix_hash = llm_hash_tokens(prefix_tokens, n_prefix_tokens);
+
+    for (int i = 0; i < LLM_KV_SNAPSHOT_SLOTS; i++) {
+        if (llm_kv_snapshot_prefix_match(&llm_kv_snapshots[i], prefix_tokens,
+                                         n_prefix_tokens, prefix_hash)) {
+            s = &llm_kv_snapshots[i];
+            break;
+        }
+    }
+
+    if (!s || !s->in_use) return -1;
+    if (s->n_layers != m->n_layers || s->max_seq != m->max_seq ||
+        s->n_kv_heads != m->n_kv_heads || s->head_dim != m->head_dim)
+        return -1;
+
+    llm_reset_cache();
+
+    kv_dim = m->n_kv_heads * m->head_dim;
+    layer_stride = m->max_seq * kv_dim;
+    snap_layer_stride = s->cached_len * kv_dim;
+
+    for (int L = 0; L < m->n_layers; L++) {
+        float *dst_k = m->k_cache + (uint64_t)L * layer_stride;
+        float *dst_v = m->v_cache + (uint64_t)L * layer_stride;
+        const float *src_k = s->k_cache + (uint64_t)L * snap_layer_stride;
+        const float *src_v = s->v_cache + (uint64_t)L * snap_layer_stride;
+        kmemcpy(dst_k, src_k, (uint64_t)snap_layer_stride * sizeof(float));
+        kmemcpy(dst_v, src_v, (uint64_t)snap_layer_stride * sizeof(float));
+    }
+
+    m->cache_len = s->cached_len;
+
+#ifdef ENABLE_CUDA
+    if (gpu_ctx.gpu_fwd) {
+        const backend_t *be = backend_get_by_id(BACKEND_CUDA);
+        uint64_t prefix_bytes = (uint64_t)s->cached_len * kv_dim * sizeof(float);
+        for (int L = 0; L < m->n_layers; L++) {
+            if (m->layers[L].kv_reuse_layer < 0 && gpu_ctx.layers[L].d_k_cache) {
+                float *src_k = m->k_cache + (uint64_t)L * layer_stride;
+                float *src_v = m->v_cache + (uint64_t)L * layer_stride;
+                be->mem.upload(gpu_ctx.layers[L].d_k_cache, src_k, prefix_bytes);
+                be->mem.upload(gpu_ctx.layers[L].d_v_cache, src_v, prefix_bytes);
+            }
+        }
+    }
+#endif
+
+    return s->cached_len;
+}
+
+int llm_agent_ctx_reset(int ctx_id)
+{
+    if (ctx_id < 0 || ctx_id >= LLM_AGENT_CTX_SLOTS) return -1;
+    kmemset(&llm_agent_ctx[ctx_id], 0, sizeof(llm_agent_ctx[ctx_id]));
+    llm_agent_ctx[ctx_id].in_use = 1;
+    return 0;
+}
+
+int llm_agent_ctx_append_tokens(int ctx_id, const int *tokens, int n_tokens)
+{
+    llm_agent_ctx_slot_t *ctx;
+
+    if (ctx_id < 0 || ctx_id >= LLM_AGENT_CTX_SLOTS) return -1;
+    if (!tokens || n_tokens <= 0) return -1;
+
+    ctx = &llm_agent_ctx[ctx_id];
+    if (!ctx->in_use) {
+        kmemset(ctx, 0, sizeof(*ctx));
+        ctx->in_use = 1;
+    }
+
+    if (ctx->n_tokens + n_tokens > LLM_AGENT_CTX_MAX_TOKENS) {
+        int drop = (ctx->n_tokens + n_tokens) - LLM_AGENT_CTX_MAX_TOKENS;
+        if (drop >= ctx->n_tokens) {
+            ctx->n_tokens = 0;
+        } else if (drop > 0) {
+            int remain = ctx->n_tokens - drop;
+            for (int i = 0; i < remain; i++)
+                ctx->tokens[i] = ctx->tokens[i + drop];
+            ctx->n_tokens = remain;
+        }
+    }
+
+    if (ctx->n_tokens + n_tokens > LLM_AGENT_CTX_MAX_TOKENS) {
+        n_tokens = LLM_AGENT_CTX_MAX_TOKENS - ctx->n_tokens;
+    }
+    if (n_tokens <= 0) return ctx->n_tokens;
+
+    kmemcpy(ctx->tokens + ctx->n_tokens, tokens, (uint64_t)n_tokens * sizeof(int));
+    ctx->n_tokens += n_tokens;
+    return ctx->n_tokens;
+}
+
+int llm_agent_ctx_generate(int ctx_id, int *output_tokens, int max_output_tokens,
+                           int max_gen, float temperature)
+{
+    llm_agent_ctx_slot_t *ctx;
+    int n_gen;
+
+    if (!llm_is_loaded()) return -1;
+    if (ctx_id < 0 || ctx_id >= LLM_AGENT_CTX_SLOTS) return -1;
+    if (!output_tokens || max_output_tokens <= 0) return -1;
+
+    ctx = &llm_agent_ctx[ctx_id];
+    if (!ctx->in_use || ctx->n_tokens <= 0) return -1;
+
+    if (max_gen < 1) max_gen = 256;
+
+    /* Token-native agent loop: no text rebuild / retokenization boundary. */
+    n_gen = llm_generate_tokens(ctx->tokens, ctx->n_tokens,
+                                output_tokens, max_output_tokens,
+                                max_gen, temperature, 0);
+    if (n_gen <= 0) return n_gen;
+
+    llm_agent_ctx_append_tokens(ctx_id, output_tokens, n_gen);
+    return n_gen;
+}
+
+int llm_rag_set_prefix_embeddings(const float *embeddings, int n_prefix, int dim)
+{
+    uint64_t bytes;
+
+    if (!llm_is_loaded() || !embeddings || n_prefix <= 0 || dim <= 0) return -1;
+    if (dim != llm_model.dim) return -1;
+    if (n_prefix > LLM_RAG_PREFIX_MAX) n_prefix = LLM_RAG_PREFIX_MAX;
+
+    llm_rag_prefix_clear_internal();
+
+    bytes = (uint64_t)n_prefix * dim * sizeof(float);
+    llm_rag_prefix.emb = (float *)tensor_alloc(bytes);
+    if (!llm_rag_prefix.emb) return -1;
+
+    kmemcpy(llm_rag_prefix.emb, embeddings, bytes);
+    llm_rag_prefix.active = 1;
+    llm_rag_prefix.n_prefix = n_prefix;
+    llm_rag_prefix.dim = dim;
+    return n_prefix;
+}
+
+void llm_rag_clear_prefix_embeddings(void)
+{
+    llm_rag_prefix_clear_internal();
+}
+
+int llm_set_vector_prefix(const float *vectors, int n_vectors, int dim)
+{
+    return llm_rag_set_prefix_embeddings(vectors, n_vectors, dim);
+}
+
+void llm_clear_vector_prefix(void)
+{
+    llm_rag_clear_prefix_embeddings();
+}
+
+int llm_speculative_verify_tokens(const int *context_tokens, int n_context,
+                                  const int *draft_tokens, int n_draft)
+{
+    llm_model_t *m;
+    int pos = 0;
+    int accepted = 0;
+    int next;
+
+    if (!llm_is_loaded() || !context_tokens || !draft_tokens) return -1;
+    if (n_context <= 0 || n_draft <= 0) return 0;
+    if (__sync_lock_test_and_set(&llm_inference_active, 1)) return -1;
+
+    m = &llm_model;
+    llm_reset_cache();
+
+    for (int i = 0; i < n_context && pos < m->max_seq - 1; i++) {
+        llm_forward_token(m, llm_logits, context_tokens[i], pos);
+        pos++;
+    }
+
+    if (pos <= 0) {
+        __sync_lock_release(&llm_inference_active);
+        return 0;
+    }
+
+    next = llm_sample(llm_logits, m->vocab_size, 0.0f);
+    for (int i = 0; i < n_draft && pos < m->max_seq - 1; i++) {
+        if (draft_tokens[i] != next) break;
+        accepted++;
+        llm_forward_token(m, llm_logits, draft_tokens[i], pos);
+        pos++;
+        next = llm_sample(llm_logits, m->vocab_size, 0.0f);
+    }
+
+    m->cache_len = pos;
+    __sync_lock_release(&llm_inference_active);
+    return accepted;
+}
+
+int llm_rollout_reset(void)
+{
+    kmemset(&llm_rollout_trace, 0, sizeof(llm_rollout_trace));
+    return 0;
+}
+
+int llm_rollout_append_step(int token_id, float logprob, float value)
+{
+    llm_rollout_step_t *step;
+
+    if (llm_rollout_trace.n_steps >= LLM_ROLLOUT_MAX_STEPS) return -1;
+    step = &llm_rollout_trace.steps[llm_rollout_trace.n_steps++];
+    step->token_id = token_id;
+    step->logprob = logprob;
+    step->value = value;
+    step->reward = 0.0f;
+    step->done = 0;
+    return llm_rollout_trace.n_steps;
+}
+
+int llm_rollout_set_step_reward(int step_idx, float reward, int done)
+{
+    if (step_idx < 0 || step_idx >= llm_rollout_trace.n_steps) return -1;
+    llm_rollout_trace.steps[step_idx].reward = reward;
+    llm_rollout_trace.steps[step_idx].done = done ? 1 : 0;
+    return 0;
+}
+
+int llm_rollout_get_steps(llm_rollout_step_t *out_steps, int max_steps)
+{
+    int n_copy;
+    if (!out_steps || max_steps <= 0) return -1;
+    n_copy = llm_rollout_trace.n_steps;
+    if (n_copy > max_steps) n_copy = max_steps;
+    if (n_copy > 0) {
+        kmemcpy(out_steps, llm_rollout_trace.steps,
+                (uint64_t)n_copy * sizeof(llm_rollout_step_t));
+    }
+    return n_copy;
+}
+
+int llm_rollout_compute_returns(float gamma, float *out_returns, int max_returns)
+{
+    float ret = 0.0f;
+    int n;
+
+    if (!out_returns || max_returns <= 0) return -1;
+    if (gamma < 0.0f) gamma = 0.0f;
+    if (gamma > 1.0f) gamma = 1.0f;
+
+    n = llm_rollout_trace.n_steps;
+    if (n > max_returns) n = max_returns;
+    if (n <= 0) return 0;
+
+    for (int i = n - 1; i >= 0; i--) {
+        if (llm_rollout_trace.steps[i].done) ret = 0.0f;
+        ret = llm_rollout_trace.steps[i].reward + gamma * ret;
+        out_returns[i] = ret;
+    }
+    return n;
 }
 
 /* Reset chat KV context */
@@ -5157,6 +8036,19 @@ int llm_chat_turn(const char *user_text, char *output, int max_output,
         kstrlcpy(output, "[no model loaded]", max_output);
         return -1;
     }
+
+    if (!llm_stream_cb && !llm_think_show) {
+        int n_gen = llm_chat_turn_tokens(user_text, llm_tokens, llm_alloc_tokens,
+                                         max_tokens > 0 ? max_tokens : 256,
+                                         temperature);
+        if (n_gen < 0) {
+            kstrlcpy(output, "[generation failed]", max_output);
+            return -1;
+        }
+        llm_decode_tokens(llm_tokens, n_gen, output, max_output);
+        return n_gen;
+    }
+
     if (__sync_lock_test_and_set(&llm_inference_active, 1)) {
         kstrlcpy(output, "[inference busy]", max_output);
         return -1;
@@ -5189,9 +8081,9 @@ int llm_chat_turn(const char *user_text, char *output, int max_output,
         m->arch[0]=='q' && m->arch[1]=='w' && m->arch[2]=='e' && m->arch[3]=='n';
 
     if (is_gemma) {
-        TA("<turn|>user\n");
+        TA("<|turn>user\n");
         TA(user_text);
-        TA("\n<turn|>model\n");
+        TA("<turn|>\n<|turn>model\n");
     } else if (is_phi3) {
         TA("<|user|>\n");
         TA(user_text);
@@ -5221,6 +8113,15 @@ int llm_chat_turn(const char *user_text, char *output, int max_output,
         n_tokens++;
     } else {
         for (int i = 0; i < n_tokens; i++) llm_tokens[i] = llm_tokens[i + 1];
+    }
+
+    /* Inject <|think|> token for models that support thinking.
+     * Only inject when llm_think_enabled == 2 (force-think mode).
+     * Default (1) = detect and handle organically when model emits it. */
+    if (llm_think_enabled >= 2 && is_gemma && n_tokens > 0 &&
+        n_tokens < llm_alloc_tokens - 2) {
+        llm_tokens[n_tokens++] = LLM_THINK_TOKEN;
+        LOG_DBG("THINK", "force-injected <|think|> into chat turn");
     }
 
     if (n_tokens <= 0) {

@@ -90,7 +90,8 @@ CUDA_API void ck_dequantize(float *out, const void *data, int n_elements,
  * out[n_heads * head_dim] = Attention(Q, K_cache, V_cache) */
 CUDA_API void ck_attention(float *out, const float *Q, const float *K,
                            const float *V, int n_heads, int n_kv_heads,
-                           int head_dim, int seq_len, float scale, float softcap);
+                           int head_dim, int seq_len, int max_seq,
+                           float scale, float softcap);
 
 /* KV cache update: insert new K,V vectors at position pos */
 CUDA_API void ck_kv_update(float *K_cache, float *V_cache,
@@ -104,6 +105,27 @@ CUDA_API void ck_embed_lookup(float *out, const void *table, int token_id,
 
 /* Softcap: x = cap * tanh(x / cap) */
 CUDA_API void ck_softcap(float *x, int n, float cap);
+
+/* ─── Async memory ops (non-blocking) ─── */
+CUDA_API int  ck_upload_async(void *dst, const void *src, uint64_t size);
+CUDA_API int  ck_download_async(void *dst, const void *src, uint64_t size);
+CUDA_API void ck_stream_sync_transfer(void);
+CUDA_API void ck_stream_sync_compute(void);
+
+/* ─── Fused QKV normalization + RoPE ─── */
+CUDA_API void ck_fused_qk_norm_rope(
+    float *Q, float *K,
+    const float *q_norm_w, const float *k_norm_w,
+    int n_heads, int n_kv_heads, int head_dim,
+    int pos, float rope_base, const float *rope_freqs,
+    float eps, int rope_dim);
+
+/* Per-head V magnitude normalization */
+CUDA_API void ck_v_norm(float *V, int n_kv_heads, int head_dim, float eps);
+
+/* GEMV on compute stream (non-blocking) */
+CUDA_API void ck_gemv_async(float *out, const void *W, const float *x,
+                            int out_dim, int in_dim, int type_id);
 
 #ifdef __cplusplus
 }

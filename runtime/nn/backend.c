@@ -7,14 +7,46 @@
  */
 
 #include "runtime/nn/backend.h"
-#include <string.h>
-#include <math.h>
 
 #ifdef HYPERTENSOR_HOSTED
+#include <string.h>
+#include <math.h>
 #include "hal.h"
 #else
 #include "kernel/core/kernel.h"
 #include "kernel/mm/tensor_mm.h"
+#include "runtime/tensor/tensor_cpu.h"
+/* Freestanding math compatibility shims */
+#define memcpy  kmemcpy
+#define sqrtf   fast_sqrtf
+#define expf    fast_expf
+#define tanhf   fast_tanhf
+static float sinf(float x) {
+    /* Bhaskara-grade polynomial: sin(x) for x in [-pi, pi] */
+    const float pi = 3.14159265f;
+    while (x > pi) x -= 2*pi;
+    while (x < -pi) x += 2*pi;
+    /* Parabolic approx: 4x(pi-|x|) / (5pi^2 - 4|x|(pi-|x|)) */
+    float ax = x < 0 ? -x : x;
+    float y = 4.0f * x * (pi - ax);
+    float d = 5.0f * pi * pi - 4.0f * ax * (pi - ax);
+    return y / d;
+}
+static float cosf(float x) { return sinf(x + 1.5707963f); }
+static float powf(float base, float exp) {
+    /* exp * ln(base) → fast path for small integer exponents */
+    if (exp == 0.0f) return 1.0f;
+    if (exp == 1.0f) return base;
+    if (exp == 2.0f) return base * base;
+    /* General: base^exp = e^(exp * ln(base)) via fast_expf */
+    /* Approximate ln(base) using log2f: ln(x) ≈ (as_int(x)/2^23 - 127) * ln(2) */
+    union { float f; uint32_t u; } fb = { .f = base };
+    float ln_base = ((float)(fb.u >> 23) - 127.0f) * 0.6931472f;
+    /* Refine: mantissa correction */
+    fb.u = (fb.u & 0x007FFFFF) | 0x3F800000;
+    ln_base += (fb.f - 1.0f) * (2.0f - fb.f * 0.333333f);
+    return fast_expf(exp * ln_base);
+}
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════════
@@ -279,7 +311,7 @@ static void cpu_scale(float *out, const float *x, float s, int n) {
 static void cpu_attention(float *out, const float *Q,
                           const float *K_cache, const float *V_cache,
                           int n_heads, int n_kv_heads, int head_dim,
-                          int seq_len, float scale, float softcap) {
+                          int seq_len, int max_seq, float scale, float softcap) {
     int kv_group = n_heads / n_kv_heads;
     /* Allocate scratch for attention scores */
     float *scores = (float *)cpu_alloc(seq_len * sizeof(float));
@@ -291,7 +323,7 @@ static void cpu_attention(float *out, const float *Q,
 
         /* Compute attention scores: Q·K^T / sqrt(d) */
         for (int t = 0; t < seq_len; t++) {
-            const float *kh = K_cache + (kv_h * seq_len + t) * head_dim;
+            const float *kh = K_cache + (kv_h * max_seq + t) * head_dim;
             float s = 0.0f;
             for (int d = 0; d < head_dim; d++) s += qh[d] * kh[d];
             s *= scale;
@@ -307,7 +339,7 @@ static void cpu_attention(float *out, const float *Q,
         for (int d = 0; d < head_dim; d++) {
             float v = 0.0f;
             for (int t = 0; t < seq_len; t++)
-                v += scores[t] * V_cache[(kv_h * seq_len + t) * head_dim + d];
+                v += scores[t] * V_cache[(kv_h * max_seq + t) * head_dim + d];
             oh[d] = v;
         }
     }

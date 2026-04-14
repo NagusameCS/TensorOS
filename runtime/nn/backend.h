@@ -104,7 +104,7 @@ typedef struct {
     void (*attention)(float *out, const float *Q,
                       const float *K_cache, const float *V_cache,
                       int n_heads, int n_kv_heads, int head_dim,
-                      int seq_len, float scale, float softcap);
+                      int seq_len, int max_seq, float scale, float softcap);
 
     /* KV cache update: write new K/V vectors to cache at position pos */
     void (*kv_update)(float *K_cache, float *V_cache,
@@ -163,6 +163,18 @@ extern const backend_t backend_cpu;
 /* ─── Optional backends (linked when available) ─── */
 #ifdef ENABLE_CUDA
 extern const backend_t backend_cuda;
+
+/* CUDA-specific fused kernels (bypass vtable for perf-critical paths) */
+void cuda_fused_qk_norm_rope(float *Q, float *K,
+    const float *q_norm_w, const float *k_norm_w,
+    int n_heads, int n_kv_heads, int head_dim,
+    int pos, float rope_base, const float *rope_freqs,
+    float eps, int rope_dim);
+void cuda_v_norm(float *V, int n_kv_heads, int head_dim, float eps);
+int  cuda_upload_async(void *dst, const void *src, uint64_t size);
+int  cuda_download_async(void *dst, const void *src, uint64_t size);
+void cuda_stream_sync_transfer(void);
+void cuda_stream_sync_compute(void);
 #endif
 
 #ifdef ENABLE_MLIR

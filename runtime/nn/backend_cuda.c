@@ -56,11 +56,18 @@ typedef void     (*fn_scale)(float *, const float *, float, int);
 typedef float    (*fn_dot)(const float *, const float *, int);
 typedef void     (*fn_dequantize)(float *, const void *, int, int);
 typedef void     (*fn_attention)(float *, const float *, const float *, const float *,
-                                 int, int, int, int, float, float);
+                                 int, int, int, int, int, float, float);
 typedef void     (*fn_kv_update)(float *, float *, const float *, const float *,
                                   int, int, int, int, int);
 typedef void     (*fn_embed)(float *, const void *, int, int, int);
 typedef void     (*fn_softcap)(float *, int, float);
+typedef int      (*fn_upload_async)(void *, const void *, uint64_t);
+typedef int      (*fn_download_async)(void *, const void *, uint64_t);
+typedef void     (*fn_stream_sync)(void);
+typedef void     (*fn_fused_qk_norm_rope)(float *, float *, const float *, const float *,
+                                           int, int, int, int, float, const float *, float, int);
+typedef void     (*fn_v_norm)(float *, int, int, float);
+typedef void     (*fn_gemv_async)(float *, const void *, const float *, int, int, int);
 
 /* ─── Dynamic dispatch table ─── */
 static struct {
@@ -91,6 +98,13 @@ static struct {
     fn_kv_update    kv_update;
     fn_embed        embed;
     fn_softcap      softcap;
+    fn_upload_async upload_async;
+    fn_download_async download_async;
+    fn_stream_sync  stream_sync_transfer;
+    fn_stream_sync  stream_sync_compute;
+    fn_fused_qk_norm_rope fused_qk_norm_rope;
+    fn_v_norm       v_norm;
+    fn_gemv_async   gemv_async;
 } ck;
 
 /* Load a symbol, return 0 on success */
@@ -143,8 +157,13 @@ static int cuda_load_library(void) {
     LOAD_SYM(attention,    "ck_attention");
     LOAD_SYM(kv_update,    "ck_kv_update");
     LOAD_SYM(embed,        "ck_embed_lookup");
-    LOAD_SYM(softcap,      "ck_softcap");
-
+    LOAD_SYM(softcap,      "ck_softcap");    LOAD_SYM(upload_async,      "ck_upload_async");
+    LOAD_SYM(download_async,    "ck_download_async");
+    LOAD_SYM(stream_sync_transfer, "ck_stream_sync_transfer");
+    LOAD_SYM(stream_sync_compute,  "ck_stream_sync_compute");
+    LOAD_SYM(fused_qk_norm_rope,   "ck_fused_qk_norm_rope");
+    LOAD_SYM(v_norm,               "ck_v_norm");
+    LOAD_SYM(gemv_async,           "ck_gemv_async");
     return 0;
 }
 
@@ -208,8 +227,8 @@ static void cuda_dequant(float *o, const void *d, int n, ggml_type_t t) {
 }
 
 static void cuda_attention(float *o, const float *Q, const float *K, const float *V,
-                           int nh, int nkv, int hd, int sl, float sc, float cap) {
-    ck.attention(o, Q, K, V, nh, nkv, hd, sl, sc, cap);
+                           int nh, int nkv, int hd, int sl, int ms, float sc, float cap) {
+    ck.attention(o, Q, K, V, nh, nkv, hd, sl, ms, sc, cap);
 }
 
 static void cuda_kv_update(float *K, float *V, const float *Kn, const float *Vn,
@@ -223,6 +242,41 @@ static void cuda_embed(float *o, const void *t, int id, int d, ggml_type_t ty) {
 
 static void cuda_softcap_fn(float *x, int n, float c) {
     ck.softcap(x, n, c);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * CUDA-specific fused kernels — bypass vtable for performance
+ * ════════════════════════════════════════════════════════════════════════ */
+
+void cuda_fused_qk_norm_rope(float *Q, float *K,
+    const float *q_norm_w, const float *k_norm_w,
+    int n_heads, int n_kv_heads, int head_dim,
+    int pos, float rope_base, const float *rope_freqs,
+    float eps, int rope_dim)
+{
+    ck.fused_qk_norm_rope(Q, K, q_norm_w, k_norm_w,
+        n_heads, n_kv_heads, head_dim,
+        pos, rope_base, rope_freqs, eps, rope_dim);
+}
+
+void cuda_v_norm(float *V, int n_kv_heads, int head_dim, float eps) {
+    ck.v_norm(V, n_kv_heads, head_dim, eps);
+}
+
+int cuda_upload_async(void *dst, const void *src, uint64_t size) {
+    return ck.upload_async(dst, src, size);
+}
+
+int cuda_download_async(void *dst, const void *src, uint64_t size) {
+    return ck.download_async(dst, src, size);
+}
+
+void cuda_stream_sync_transfer(void) {
+    ck.stream_sync_transfer();
+}
+
+void cuda_stream_sync_compute(void) {
+    ck.stream_sync_compute();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════

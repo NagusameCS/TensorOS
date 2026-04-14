@@ -1,0 +1,83 @@
+{
+  "name": "tensorchat-vscode",
+  "displayName": "TensorChat Studio",
+  "description": "AI chat and code engine for TensorOS — Ollama-compatible inference with tok/s telemetry.",
+  "version": "0.2.0",
+  "publisher": "tensoros",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/tensoros/tensoros" },
+  "bugs": { "url": "https://github.com/tensoros/tensoros/issues" },
+  "homepage": "https://github.com/tensoros/tensoros#readme",
+  "keywords": ["tensoros", "tensorchat", "llm", "inference", "ai", "ollama", "chat", "code"],
+  "engines": { "vscode": "^1.90.0" },
+  "categories": ["Machine Learning", "Chat", "Other"],
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "TensorChat",
+      "properties": {
+        "tensorchat.provider": {
+          "type": "string",
+          "default": "hypertensor",
+          "enum": ["hypertensor", "ollama", "openai-compatible"],
+          "description": "Inference provider backend."
+        },
+        "tensorchat.baseUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8080",
+          "description": "Base URL for the inference API (HyperTensor default: http://127.0.0.1:8080)."
+        },
+        "tensorchat.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model name (e.g. llama3, codellama, gemma2). Leave empty to auto-detect."
+        },
+        "tensorchat.timeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "minimum": 5000,
+          "maximum": 600000,
+          "description": "HTTP request timeout in milliseconds."
+        },
+        "tensorchat.maxTokens": {
+          "type": "number",
+          "default": -1,
+          "minimum": -1,
+          "maximum": 131072,
+          "description": "Maximum tokens to generate per response. Set to -1 for unlimited."
+        },
+        "tensorchat.temperature": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0,
+          "maximum": 2,
+          "description": "Sampling temperature."
+        },
+        "tensorchat.systemPrompt": {
+          "type": "string",
+          "default": "You are TensorChat, an expert AI programming assistant. Be concise, accurate, and helpful. When asked to write code, provide complete, working implementations.",
+          "description": "System prompt prepended to all conversations."
+        }
+      }
+    },
+    "commands": [
+      { "command": "tensorchat.openChat", "title": "TensorChat: Open Chat" },
+      { "command": "tensorchat.openCode", "title": "TensorChat: Open Code Assistant" },
+      { "command": "tensorchat.explainSelection", "title": "TensorChat: Explain Selection" },
+      { "command": "tensorchat.refactorSelection", "title": "TensorChat: Refactor Selection" },
+      { "command": "tensorchat.generateTests", "title": "TensorChat: Generate Tests" },
+      { "command": "tensorchat.listModels", "title": "TensorChat: List Available Models" }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "tensorchat.explainSelection", "group": "tensorchat", "when": "editorHasSelection" },
+        { "command": "tensorchat.refactorSelection", "group": "tensorchat", "when": "editorHasSelection" },
+        { "command": "tensorchat.generateTests", "group": "tensorchat", "when": "editorHasSelection" }
+      ]
+    },
+    "keybindings": [
+      { "command": "tensorchat.openChat", "key": "ctrl+shift+t", "mac": "cmd+shift+t" }
+    ]
+  }
+}

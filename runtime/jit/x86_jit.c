@@ -1280,12 +1280,117 @@ jit_gemv_q8_fn jit_compile_q8_gemv(int rows, int cols)
 
 jit_matmul_fn jit_compile_fused_matmul_relu(int M, int N, int K)
 {
-    /* First compile a regular matmul */
-    jit_matmul_fn base = jit_compile_matmul_kernel(M, N, K);
-    if (!base) return NULL;
-    /* For now, return the base matmul — a full fused kernel would interleave
-     * the relu into the innermost loop. TODO: implement true fusion. */
-    return base;
+    int j_vecs = N / 4;
+    if (j_vecs < 1) return NULL;
+
+    jit_buf_t *b = jit_create(4096);
+    if (!b) return NULL;
+
+    jit_prologue(b);
+
+    /* Save base pointers to callee-saved regs */
+    jit_mov_reg_reg(b, R12, RDI); /* C */
+    jit_mov_reg_reg(b, R13, RSI); /* A */
+    jit_mov_reg_reg(b, R14, RDX); /* B */
+
+    /* ---- Step 1: Zero C[M*N] using xorps + movups ---- */
+    jit_xorps(b, XMM7, XMM7);
+    jit_mov_reg_reg(b, RAX, R12);
+    jit_xor_reg_reg(b, RCX, RCX);
+    int ztop = b->len;
+    jit_movups_store(b, RAX, 0, XMM7);
+    jit_add_reg_imm32(b, RAX, 16);
+    jit_inc_reg(b, RCX);
+    jit_cmp_reg_imm32(b, RCX, (M * N + 3) / 4);
+    jit_jl_back(b, ztop);
+
+    /* ---- Step 2: Triple loop i-k-j with fused ReLU ---- */
+    /* XMM6 = {0,0,0,0} for ReLU max(0, x) — persists across all loops */
+    jit_xorps(b, XMM6, XMM6);
+
+    jit_xor_reg_reg(b, R15, R15);   /* i = 0 */
+    int i_top = b->len;
+
+    /* C_row = C + i * N * 4 */
+    jit_mov_reg_reg(b, RDX, R15);
+    jit_imul_imm32(b, RDX, RDX, N * 4);
+    jit_add_reg_reg(b, RDX, R12);
+
+    /* A_row_base = A + i * K * 4 */
+    jit_mov_reg_reg(b, RAX, R15);
+    jit_imul_imm32(b, RAX, RAX, K * 4);
+    jit_add_reg_reg(b, RAX, R13);
+    jit_push(b, RAX);
+
+    /* k loop */
+    jit_xor_reg_reg(b, RBX, RBX);
+    int k_top = b->len;
+
+    jit_mov_reg_mem(b, RAX, RSP, 0);
+    jit_mov_reg_reg(b, RSI, RBX);
+    jit_shl_imm(b, RSI, 2);
+    jit_add_reg_reg(b, RSI, RAX);
+    jit_movss_load(b, XMM0, RSI, 0);
+    jit_shufps(b, XMM0, XMM0, 0x00);
+
+    jit_mov_reg_reg(b, RCX, RBX);
+    jit_imul_imm32(b, RCX, RCX, N * 4);
+    jit_add_reg_reg(b, RCX, R14);
+
+    /* j loop */
+    jit_xor_reg_reg(b, RDI, RDI);
+    int j_top = b->len;
+
+    jit_mov_reg_reg(b, RSI, RCX);
+    jit_add_reg_reg(b, RSI, RDI);
+    jit_movups_load(b, XMM1, RSI, 0);
+
+    jit_mov_reg_reg(b, RSI, RDX);
+    jit_add_reg_reg(b, RSI, RDI);
+    jit_movups_load(b, XMM2, RSI, 0);
+
+    jit_mulps(b, XMM1, XMM0);
+    jit_addps(b, XMM2, XMM1);
+
+    jit_movups_store(b, RSI, 0, XMM2);
+
+    jit_add_reg_imm32(b, RDI, 16);
+    jit_cmp_reg_imm32(b, RDI, j_vecs * 16);
+    jit_jl_back(b, j_top);
+
+    jit_inc_reg(b, RBX);
+    jit_cmp_reg_imm32(b, RBX, K);
+    jit_jl_back(b, k_top);
+
+    jit_pop(b, RAX);
+
+    /* ---- Fused ReLU: apply max(0, C[i*N + j]) to this row ---- */
+    jit_xor_reg_reg(b, RDI, RDI);
+    int relu_top = b->len;
+
+    jit_mov_reg_reg(b, RSI, RDX);
+    jit_add_reg_reg(b, RSI, RDI);
+    jit_movups_load(b, XMM0, RSI, 0);
+    jit_maxps(b, XMM0, XMM6);       /* max(C[j..j+3], 0) */
+    jit_movups_store(b, RSI, 0, XMM0);
+
+    jit_add_reg_imm32(b, RDI, 16);
+    jit_cmp_reg_imm32(b, RDI, j_vecs * 16);
+    jit_jl_back(b, relu_top);
+
+    /* i++ */
+    jit_inc_reg(b, R15);
+    jit_cmp_reg_imm32(b, R15, M);
+    jit_jl_back(b, i_top);
+
+    jit_epilogue(b);
+
+    vmm_mark_rx(b->code, b->cap);
+    jit_matmul_fn fn = (jit_matmul_fn)(void *)b->code;
+    jit_total_bytes += b->len;
+    jit_num_kernels++;
+
+    return fn;
 }
 
 /* =============================================================================

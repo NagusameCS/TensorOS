@@ -72,8 +72,21 @@ static int64_t sys_write(uint64_t fd, const uint8_t *buf, uint64_t len)
 
 static int64_t sys_read(uint64_t fd, uint8_t *buf, uint64_t len)
 {
-    (void)fd; (void)buf; (void)len;
-    return -1; /* Not implemented */
+    if (fd != 0) return -1; /* Only stdin (fd 0) supported */
+    if (!buf || len == 0) return -1;
+
+    /* Read from keyboard/UART/BT — line-buffered */
+    extern char keyboard_getchar(void);
+    extern int keyboard_has_key(void);
+    uint64_t count = 0;
+    while (count < len) {
+        if (!keyboard_has_key() && count > 0)
+            break; /* Return what we have if no more input ready */
+        char ch = keyboard_getchar();
+        buf[count++] = (uint8_t)ch;
+        if (ch == '\n') break;   /* Line-buffered: return on newline */
+    }
+    return (int64_t)count;
 }
 
 static int64_t sys_klog(const char *msg, uint64_t len)

@@ -164,9 +164,19 @@ int tensor_attention(tensor_desc_t *output,
     if (kstate.gpu_count > 0)
         return gpu_tensor_attention(0, output, Q, K, V, scale);
 
-    /* CPU fallback — attention requires GPU, report error */
+    /* CPU fallback using tensor_cpu attention implementation */
+    *output = *Q;
+    if (Q->data_virt && K->data_virt && V->data_virt && output->data_virt) {
+        int seq_len = (int)Q->shape[0];
+        int head_dim = (int)Q->shape[1];
+        tensor_cpu_attention((float *)output->data_virt,
+                             (const float *)Q->data_virt,
+                             (const float *)K->data_virt,
+                             (const float *)V->data_virt,
+                             seq_len, head_dim);
+    }
     kstate.tensor_ops_total++;
-    return -1;
+    return 0;
 }
 
 int tensor_layernorm(tensor_desc_t *output, const tensor_desc_t *input,
@@ -177,6 +187,25 @@ int tensor_layernorm(tensor_desc_t *output, const tensor_desc_t *input,
         return gpu_tensor_layernorm(0, output, input, gamma, beta, epsilon);
 
     *output = *input;
+    if (input->data_virt && output->data_virt) {
+        int n = (int)(input->size_bytes / sizeof(float));
+        /* Compute layernorm: (x - mean) / sqrt(var + eps) */
+        tensor_cpu_layernorm((float *)output->data_virt,
+                             (const float *)input->data_virt, n, epsilon);
+        /* Apply affine: out = out * gamma + beta */
+        if (gamma && gamma->data_virt) {
+            const float *g = (const float *)gamma->data_virt;
+            float *o = (float *)output->data_virt;
+            if (beta && beta->data_virt) {
+                const float *b = (const float *)beta->data_virt;
+                for (int i = 0; i < n; i++)
+                    o[i] = o[i] * g[i] + b[i];
+            } else {
+                for (int i = 0; i < n; i++)
+                    o[i] = o[i] * g[i];
+            }
+        }
+    }
     kstate.tensor_ops_total++;
     return 0;
 }
