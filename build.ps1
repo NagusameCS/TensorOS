@@ -89,6 +89,9 @@ $SOURCES = @(
     "runtime\nn\paged_attn.c",
     "runtime\nn\safetensors.c",
     "runtime\nn\onnx.c",
+    "runtime\nn\axiom_linalg.c",
+    "runtime\nn\axiom_geo.c",
+    "runtime\nn\axiom_beta.c",
     "runtime\pseudocode\pseudo_stdlib.c",
     "runtime\compute\vulkan_compute.c",
     "kernel\net\distributed.c"

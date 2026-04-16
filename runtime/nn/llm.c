@@ -136,6 +136,18 @@ static int llm_decode_tokens_to_text(const llm_model_t *m, const int *tokens,
     return out_pos;
 }
 
+static int llm_ends_with(const char *s, int len, const char *suffix)
+{
+    int slen = (int)kstrlen(suffix);
+    if (slen <= 0 || len < slen) return 0;
+    {
+        const char *tail = s + (len - slen);
+        for (int i = 0; i < slen; i++)
+            if (tail[i] != suffix[i]) return 0;
+    }
+    return 1;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────── */
 /*  Dynamic scratch arena (allocated from tensor heap after model load)         */
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -4819,7 +4831,7 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
             if (si > 0) llm_stream_cb(stream_buf, si, llm_stream_cb_ud);
         }
 
-        /* Check for known stop sequences in recent text */
+        /* Check stop sequences as suffixes instead of scanning full output. */
         if (out_pos >= 4) {
             static const char *stop_seqs[] = {
                 "<|im_end|>", "<|endoftext|>", "<|end|>",
@@ -4827,10 +4839,10 @@ static int llm_generate(llm_model_t *m, const int *prompt_tokens, int n_prompt,
             };
             int stop = 0;
             for (int si = 0; stop_seqs[si] && !stop; si++) {
-                const char *found = llm_strstr(output_text, stop_seqs[si]);
-                if (found) {
+                if (llm_ends_with(output_text, out_pos, stop_seqs[si])) {
                     stop = 1;
-                    int trunc_at = (int)(found - output_text);
+                    int trunc_at = out_pos - (int)kstrlen(stop_seqs[si]);
+                    if (trunc_at < 0) trunc_at = 0;
                     output_text[trunc_at] = '\0';
                     out_pos = trunc_at;
                 }

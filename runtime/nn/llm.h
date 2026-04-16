@@ -475,4 +475,10 @@ int llm_test_decode_token(int token_id, char *buf, int max_len);
 #include "runtime/nn/tensor_bridge.h"
 tensor_bridge_t *llm_get_bridge(void);
 
+/* Model introspection (for axiomatic subsystem) */
+const char *llm_model_arch(void);
+int  llm_model_layers(void);
+int  llm_model_dim(void);
+int  llm_model_vocab(void);
+
 #endif /* TENSOROS_LLM_H */
