@@ -5,6 +5,8 @@
 **Competitors:** Ollama v0.20.4 (llama.cpp, GPU), HyperTensor (custom GPU runtime)  
 **Methodology:** 30 measured trials × 4 prompts × 3 N-values × 3 runtimes = **1,080 runs**. Randomised trial order, 2 warmup discards. 95 % CI = 1.96 σ/√30.
 
+This file is a working benchmark note. It keeps the tables, the odd results, and the fixes those results pointed to.
+
 ---
 
 ## 1  Decode Throughput Summary
@@ -13,8 +15,8 @@
 |---|---:|---:|---:|---:|
 | **short** (completion, EOS−limited ~13 tok) | 55–57 t/s | 39–40 t/s | 115–117 t/s | **48 %** |
 | **code** N=128–512 | 82–86 t/s | 87–91 t/s | 111–115 t/s | **74 %** |
-| **medium** N=32 | 1.7 t/s | 3.0 t/s | 160 t/s * | **1 %** 💀 |
-| **medium** N=128–512 | 0.1–0.5 t/s | 2.1–2.6 t/s | 74–120 t/s * | **< 1 %** 💀 |
+| **medium** N=32 | 1.7 t/s | 3.0 t/s | 160 t/s * | **1 %** |
+| **medium** N=128–512 | 0.1–0.5 t/s | 2.1–2.6 t/s | 74–120 t/s * | **< 1 %** |
 
 \* Ollama medium results had high variance (σ ≈ 50 t/s) — intermittent KV pressure also observed.
 

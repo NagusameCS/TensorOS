@@ -54,3 +54,27 @@ docs/EVOLUTION.md
 # Local benchmark snapshots
 bench_*.txt
 diff_full.txt
+
+# Axiomatic subsystem internal reports and state
+axiom_beta_report*.json
+axiom_warp_state.dat
+
+# OTT internal binary state
+ott_hs_disk.dat
+ott_readiness_report.json
+
+# Internal audit reports
+AUDIT_REPORT.md
+
+# Internal planning/design docs
+docs/GEODESSICAL_PLAN.md
+docs/AXIOM_BETA_INTERNAL_DESIGN.md
+
+# Internal dev utility scripts (one-off patches/fixes)
+patch_*.py
+patch*.py
+fix_*.py
+show_specstats.py
+
+# PDF/research outputs (local only)
+*.pdf

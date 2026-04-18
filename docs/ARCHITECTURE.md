@@ -2,6 +2,8 @@
 # TensorOS — Architecture Deep Dive
 # ==============================================================================
 
+This is the reference architecture file for the bare-metal side of TensorOS. It describes the boot path, memory layout, and major runtime subsystems as they exist in the current tree.
+
 ## Boot Sequence
 
 ```

@@ -4,8 +4,7 @@
 
 ## Overview
 
-Pseudocode is TensorOS's default programming language. It's designed to look like
-natural algorithmic descriptions while compiling to efficient tensor operations.
+Pseudocode is TensorOS's default programming language. The goal is readable model and tensor code that still lowers cleanly to the runtime's tensor operations.
 
 Inspired by [NaguSamecs' Pseudocode](https://github.com/NaguSamecs/Pseudocode).
 

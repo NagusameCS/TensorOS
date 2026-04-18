@@ -1,10 +1,14 @@
 # What's Irregular: TensorOS & HyperTensor
 
-A factual inventory of every custom, non-standard, or from-scratch component across both projects.
+This file answers a narrow question: which parts of TensorOS and HyperTensor are actually custom, and which parts are standard techniques with custom integration around them.
+
+It is an inventory, not a pitch. The point is to show where the codebase genuinely departs from a normal OS or a normal LLM runtime.
 
 ---
 
 ## TensorOS — Bare-Metal AI-First Operating System
+
+On the bare-metal side, the unusual part is not one subsystem in isolation. It is that inference, memory management, model loading, and a good amount of developer tooling all live in the same kernel-level environment.
 
 ### 1. Custom Bootloader & CPU Bring-Up
 
@@ -122,6 +126,8 @@ The entire transformer pipeline runs in kernel mode:
 ## HyperTensor — Hosted Inference Engine
 
 HyperTensor shares the same runtime codebase as TensorOS but compiles as a **hosted userland binary** (Windows/Linux) instead of a bare-metal kernel.
+
+The hosted side is less exotic overall, but it still carries over the same custom inference core and adds its own research-heavy pieces, especially around multi-format loading and the Axiom geometry work.
 
 ### 1. Custom Quantized Arithmetic
 

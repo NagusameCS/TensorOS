@@ -12,9 +12,9 @@
   <img src="https://img.shields.io/github/last-commit/NagusameCS/TensorOS?label=last%20commit" alt="Last Commit">
 </p>
 
-TensorOS is an operating system built from scratch with a single goal: **run AI workloads faster and cheaper, without losing accuracy.** Every layer — from the bootloader to the shell — is designed around tensors, models, and inference as first-class primitives.
+TensorOS is a from-scratch operating system and runtime stack built around model execution. The repository includes the bare-metal kernel, the hosted HyperTensor and Geodessical runtime, and the supporting docs for both.
 
-Traditional OSes treat AI as just another application. TensorOS treats AI as *the* application.
+The design choice is simple: model loading, tensor memory, inference, and deployment are treated as system concerns rather than libraries bolted onto a general-purpose OS.
 
 ### Demo: Coherent LLM Inference on Bare Metal
 
@@ -36,6 +36,16 @@ An operating system (OS) is a complex piece of software that man[ages]...
 Phi-3.5 Mini Instruct (3.8B parameters, Q4_0 quantized) running at **~162 ms/tok**
 across 4 CPU cores under QEMU WHPX with JIT-compiled forward kernels and SMP parallel
 GEMV. No OS, no drivers, no runtime — just bare metal x86_64 with AVX2+FMA SIMD.
+
+## Start Here
+
+- [Architecture Deep Dive](docs/ARCHITECTURE.md) for the kernel and memory layout
+- [What This Project Does Differently](docs/IRREGULAR_ARCHITECTURE_SUMMARY.md) for the custom parts
+- [Geodessical Plan](docs/GEODESSICAL_PLAN.md) for the OTT and Axiom work
+- [HyperTensor and Geodessical Brief](docs/HYPERTENSOR_GEODESSICAL_ARCHITECTURE_BRIEF.md) for the hosted-runtime split
+- [HyperTensor and Geodessical Paper](docs/HYPERTENSOR_GEODESSICAL_ARCHITECTURE_PAPER.md) for the longer architecture write-up
+- [Benchmark Analysis](BENCHMARK_ANALYSIS.md) for measured runtime results
+- [Audit Report](AUDIT_REPORT.md) for a codebase-level review
 
 ---
 
@@ -119,9 +129,9 @@ flowchart LR
     style G fill:#533483,stroke:#fff,color:#fff
 ```
 
-## Key Innovations
+## Architectural Choices
 
-### 1. Model Execution Units (MEUs) Replace Processes
+### 1. Model Execution Units (MEUs)
 
 Traditional OSes schedule processes and threads. TensorOS schedules **Model Execution Units** — each MEU encapsulates a model with its weights, compute graph, and I/O. The scheduler understands tensor operations and can:
 
@@ -189,7 +199,7 @@ The Pseudocode runtime includes:
 - **4-tier JIT**: Interpreter → Basic compilation → Optimized → Fully optimized
 - **Optimization passes**: Op fusion (matmul+bias+relu), precision auto-downgrade (FP32→FP16)
 
-### 5. Near-Zero-Cost Virtualization
+### 5. Virtualization Scaffold
 
 VT-x/AMD-V with EPT/NPT for hardware-accelerated containers:
 
